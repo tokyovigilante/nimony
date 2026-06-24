@@ -1506,6 +1506,15 @@ proc matchSymbol(m: var Match; f: Cursor; arg: CallArg) =
     # fast check that works for aliases too:
     if a.kind == Symbol and sameSymbol(a.symId, fs):
       discard "perfect match"
+    elif (let fdecl = tryLoadSym(fs);
+          fdecl.status != LacksNothing or fdecl.decl.stmtKind != TypeS):
+      # `fs` is not a type declaration — e.g. a template parameter (`symKind ==
+      # ParamY`) left in type position while a template body is semchecked
+      # generically, before instantiation (reached via the concreteMatch rematch
+      # path; the argument is typically already an error type). `typeImpl` would
+      # assert here. Accept it as a wildcard rather than crash: the real type
+      # check happens when the template is instantiated with concrete arguments.
+      discard "non-type placeholder (e.g. template param as type) — defer to instantiation"
     else:
       var impl = typeImpl(fs)
       if impl.kind == ParLe and impl.tagId == nifstreams.ErrT:

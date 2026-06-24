@@ -1,0 +1,10 @@
+tests/nimony/templates/ttemplate_param_as_type.nim(14, 17) Error: not a type
+tests/nimony/templates/ttemplate_param_as_type.nim(14, 22) Error: not a type
+tests/nimony/templates/ttemplate_param_as_type.nim(15, 8) Trace: instantiation from here
+tests/nimony/templates/ttemplate_param_as_type.nim(14, 46) Error: type mismatch: got: array[0..1, (err . . "not a type")] but wanted: array[0..1, (err . "not a type")]
+tests/nimony/templates/ttemplate_param_as_type.nim(14, 46) Trace: instantiation from here
+tests/nimony/templates/ttemplate_param_as_type.nim(14, 42) Error: not a type
+tests/nimony/templates/ttemplate_param_as_type.nim(14, 46) Trace: instantiation from here
+tests/nimony/templates/ttemplate_param_as_type.nim(12, 37) Error: type mismatch: got: (err . . "not a type") but wanted: (err . . "not a type")
+tests/nimony/templates/ttemplate_param_as_type.nim(14, 46) Trace: instantiation from here
+tests/nimony/templates/ttemplate_param_as_type.nim(12, 40) Error: type mismatch: got: (err . . "not a type") but wanted: (err . . "not a type")
