@@ -3783,10 +3783,17 @@ proc callDefault(c: var SemContext; dest: var TokenBuf; typ: Cursor; info: Packe
 
 proc buildObjConstrField(c: var SemContext; dest: var TokenBuf; field: Local;
                          setFields: Table[SymId, Cursor]; info: PackedLineInfo;
-                         bindings: Table[SymId, Cursor]; depth: int) =
+                         bindings: Table[SymId, Cursor]; depth: int;
+                         isUnion = false) =
   let fieldSym = field.name.symId
   if setFields.hasKey(fieldSym):
     dest.addSubtree setFields.getOrQuit(fieldSym)
+  elif isUnion:
+    # A union has ONE active member: filling the unset members with
+    # defaults emits sibling designated initializers, and C's
+    # last-initializer-wins semantics zero out the member the user
+    # actually set (black-clear-color class of bug). Emit nothing.
+    discard
   else:
     dest.addParLe(KvU, info)
     dest.add symToken(fieldSym, info)
@@ -3945,7 +3952,8 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
 
 proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
                           setFields: Table[SymId, Cursor]; info: PackedLineInfo;
-                          bindings: Table[SymId, Cursor]; depth = 0) =
+                          bindings: Table[SymId, Cursor]; depth = 0;
+                          isUnion = false) =
   var iter = initObjFieldIter()
   while nextField(iter, n, keepCase = true):
     if n.substructureKind == CaseU:
@@ -3959,7 +3967,7 @@ proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
       skip n
     else:
       let field = takeLocal(n, SkipFinalParRi)
-      buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+      buildObjConstrField(c, dest, field, setFields, info, bindings, depth, isUnion)
 
 proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
                            setFields: Table[SymId, Cursor]; info: PackedLineInfo;
@@ -4037,7 +4045,8 @@ proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
   if obj.kind == ObjectT:
     skip currentField  # parent type / inheritance slot
   if currentField.hasMore and currentField.kind != DotToken:
-    buildObjConstrFields(c, dest, currentField, setFields, info, bindings)
+    let isUnion = objDecl.kind == TypeY and hasPragma(objDecl.pragmas, UnionP)
+    buildObjConstrFields(c, dest, currentField, setFields, info, bindings, isUnion = isUnion)
   dest.addParRi()
 
 proc getAnumOwnerType(efldSym: SymId): SymId =
