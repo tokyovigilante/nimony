@@ -76,6 +76,11 @@ type
     dest: TokenBuf
     closureProcs, createsEnv, escapes: HashSet[SymId]
     localToEnv: Table[SymId, EnvField]
+    envFieldType: Table[SymId, Cursor] ## env FIELD sym -> captured local's type
+      ## (typenav cannot type `(envp ...)` nodes, so `genCall` resolves a
+      ## capture-rewritten callee's type through this instead)
+    shouldRepublish: seq[(SymId, TokenBuf)]
+      ## routines whose signatures pass 2 rewrote; flushed after the walk
     env: CurrentEnv
     hasClosures: bool
     coroCtx: coro_transform.Context
@@ -152,13 +157,20 @@ proc localToField(c: var Context; n: Cursor; local, typ: SymId): SymId =
     name.add "."
     name.add c.thisModuleSuffix
     result = pool.syms.getOrIncl(name)
-    c.localToEnv[local] = EnvField(objType: typ, field: result, typ: c.typeCache.getType(n))
+    let localTyp = c.typeCache.getType(n)
+    c.localToEnv[local] = EnvField(objType: typ, field: result, typ: localTyp)
+    c.envFieldType[result] = localTyp
 
 proc trCall(c: var Context; dest: var TokenBuf; n: var Cursor) =
   dest.add n
   inc n
-  if n.kind == Symbol:
+  if n.kind == Symbol and
+      c.typeCache.getLocalInfo(n.symId).kind notin {ParamY, LetY, VarY, ResultY}:
     # if a closure proc is called, we don't want to see it as "escaping".
+    # But when the callee is a LOCAL holding a closure value, it must still
+    # go through `tr`: a cross-proc use in call position is a capture like
+    # any other and needs the envp rewrite, otherwise the enclosing proc
+    # never creates an environment for it.
     dest.add n
     inc n
   while n.hasMore:
@@ -828,7 +840,10 @@ proc treProcBody(c: var Context; dest, init: var TokenBuf; n: var Cursor; sym: S
   else:
     tre(c, dest, n)
 
-proc treProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
+proc treProc(c: var Context; dest: var TokenBuf; n: var Cursor): SymId =
+  ## Returns the routine's symbol when the decl is concrete (so the
+  ## caller can schedule the rewritten decl for republishing), else 0.
+  result = SymId(0)
   var init = createTokenBuf(10)
   let decl = n
   copyInto dest, n:
@@ -852,6 +867,7 @@ proc treProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
 
     if isConcrete:
       treProcBody(c, dest, init, n, sym, needsHeap)
+      result = sym
     else:
       takeTree dest, n
     discard c.procStack.pop()
@@ -861,7 +877,19 @@ proc treProcLift(c: var Context; dest: var TokenBuf; n: var Cursor) =
   if c.procStack.len == 0:
     swap c.dest, dest
   var lift = createTokenBuf(16)
-  treProc c, lift, n
+  let sym = treProc(c, lift, n)
+  if sym != SymId(0):
+    # Pass 2 may have rewritten the signature (env param appended,
+    # closure-typed params/returns lowered to `(fn, env)` tuples).
+    # Schedule the rewritten decl for republishing so downstream passes
+    # (xelim temp typing, lengcgen inlining) type calls against the
+    # LOWERED signature — the published copy is still sem's otherwise.
+    # Deferred like the iter `shouldPublish` flush: publishing mid-walk
+    # would let a later symbol-use of this routine read the rewritten
+    # type and lower it a second time.
+    var copy = createTokenBuf(lift.len)
+    copy.add lift
+    c.shouldRepublish.add (sym, ensureMove copy)
   c.dest.add lift
   if c.procStack.len == 0:
     swap c.dest, dest
@@ -880,7 +908,17 @@ proc genCall(c: var Context; dest: var TokenBuf; n: var Cursor) =
   dest.add n # the call node itself
   inc n
   #var fn = n
-  let typ = c.typeCache.getType(n, {SkipAliases})
+  var typ = c.typeCache.getType(n, {SkipAliases})
+  if n.exprKind == EnvpX:
+    # capture-rewritten callee `(envp EnvType field)` from pass 1: typenav
+    # cannot type envp nodes, so resolve the captured local's type through
+    # the field instead — otherwise a captured-closure call is emitted as
+    # a plain call of the tuple value.
+    var fieldSym = n
+    inc fieldSym # at the env type symbol
+    inc fieldSym # at the field symbol
+    if fieldSym.kind == Symbol and c.envFieldType.hasKey(fieldSym.symId):
+      typ = c.envFieldType.getOrQuit(fieldSym.symId)
   # A closure iter-value call target type can appear here in two guises:
   #   - raw `(itertype … (pragmas (closure)))` — `isClosure` matches.
   #   - lifted `(tuple <proctype> (ref RootObj))` — `isLiftedClosureTuple`
@@ -920,9 +958,14 @@ proc genCall(c: var Context; dest: var TokenBuf; n: var Cursor) =
           dest.addDotToken() # no export marker
           dest.addDotToken() # no pragmas
           var t = typ
-          tre c, dest, t
+          # treType, not tre: a captured lambda's type can be decl-shaped
+          # (`(proc ...)`), which `tre` would lift as a declaration.
+          treType c, dest, t
           tre c, dest, n # value
-      dest.addSymUse tmp, info
+      # the temp holds the (fn, env) tuple — the callee is its fn slot:
+      copyIntoKind dest, TupatX, info:
+        dest.addSymUse tmp, info
+        dest.addIntLit 0, info
       dest.addParRi() # ExprX
   while n.hasMore:
     tre(c, dest, n)
@@ -1028,7 +1071,14 @@ proc tre(c: var Context; dest: var TokenBuf; n: var Cursor) =
           c.toProcType(dest, origTyp)
           dest.addRootRef info
         dest.addSymUse n.symId, info
-        dest.untypedEnv info, c.env
+        if c.env.s == SymId(0):
+          # closure value referenced where no enclosing environment exists
+          # (toplevel, or a proc none of whose locals are captured): there
+          # is nothing to pass — nil, mirroring the static-call lowering
+          # in `treCall`.
+          dest.copyIntoKind NilX, info: discard
+        else:
+          dest.untypedEnv info, c.env
       inc n
     else:
       let repWith = c.localToEnv.getOrDefault(n.symId)
@@ -1067,7 +1117,32 @@ proc tre(c: var Context; dest: var TokenBuf; n: var Cursor) =
         transformClosureIter c, dest, n
       else:
         takeTree dest, n
-    of MacroS, TemplateS, TypeS, EmitS, BreakS, ContinueS,
+    of TypeS:
+      # Rewrite closure proctypes inside type-declaration BODIES to the
+      # `(fn, env)` tuple shape: object fields (`Handler.handler`), type
+      # aliases, and generic instances (`seq[proc()]`'s payload). Pass 1
+      # handles only the itertype-alias case; without this branch a
+      # closure-typed field keeps the raw fnptr type while every value
+      # stored into it is the lowered tuple.
+      let typeStart = dest.len
+      dest.takeToken n        # TypeS tag
+      var typeSym = SymId(0)
+      if n.kind == SymbolDef:
+        typeSym = n.symId
+      takeTree dest, n        # name
+      takeTree dest, n        # exported
+      takeTree dest, n        # typevars
+      takeTree dest, n        # pragmas
+      if n.kind == ParLe and n.typeKind == TupleT and isLiftedClosureTuple(n):
+        # already the stable lowered shape (pass 1 itertype rewrite)
+        takeTree dest, n
+      else:
+        treType c, dest, n    # body
+      while n.hasMore: takeTree dest, n
+      dest.takeParRi n
+      if typeSym != SymId(0):
+        programs.publish(typeSym, dest, typeStart)
+    of MacroS, TemplateS, EmitS, BreakS, ContinueS,
       ForS, IncludeS, ImportS, FromimportS, ImportexceptS,
       ExportS, CommentS,
       PragmasS:
@@ -1175,7 +1250,11 @@ proc genObjectTypes(c: var Context; dest: var TokenBuf) =
             dest.addDotToken() # no export marker
             dest.addDotToken() # no pragmas
             var n = field.typ
-            tre(c, dest, n) # type might need an environment parameter
+            # treType, not tre: a captured lambda's type is decl-shaped
+            # (`(proc ...)`), which `tre`'s stmtKind dispatch would treat
+            # as a proc DECLARATION and lift — the field must get the
+            # lowered closure-tuple type instead.
+            treType(c, dest, n) # type might need an environment parameter
             dest.addDotToken() # no default value
           programs.publish(field.field, dest, beforeField)
     programs.publish(objType, dest, beforeType)
@@ -1230,6 +1309,10 @@ proc elimLambdas*(pass: var Pass) =
       buf.copyTree stmtsBuf.cursorAt(entry.start)
       endRead(stmtsBuf)
       publishSignature buf, entry.sym, 0
+    # Republish every routine pass 2 rewrote — same timing rationale as
+    # the iter flush above.
+    for i in 0 ..< c.shouldRepublish.len:
+      programs.publish(c.shouldRepublish[i][0], move c.shouldRepublish[i][1])
     pass.dest.add c.coroCtx.coroTypes
     pass.dest.add stmtsBuf
     pass.dest.takeParRi n2
