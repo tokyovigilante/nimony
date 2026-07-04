@@ -92,6 +92,15 @@ proc skipRoutineDeclPrefix*(n: var Cursor; parentKind: TypeKind) =
 proc skipProcTypeToParams*(t: Cursor): Cursor =
   ## Pure version: returns a cursor advanced past the prefix slots.
   result = t
+  if result.typeKind in {MutT, OutT, LentT}:
+    # A callee can be a closure value seen through a borrowed view (e.g. a
+    # `for` variable over `seq[proc()]`): `(mut (proctype ...))`.
+    inc result
+  if result.typeKind == TupleT:
+    # A lowered closure callee is `(tuple (proctype ... {.closure.}) (ref env))`
+    # (see hexer/lambdalifting). Descend into the proctype so callers that ask
+    # "what are this call's params?" work for closure calls too.
+    inc result
   if result.typeKind in RoutineTypes:
     skipToParams result
 
