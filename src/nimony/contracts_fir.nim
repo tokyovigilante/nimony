@@ -76,6 +76,13 @@ type
                                        # the inferle journal), not "know nothing".
     inlineVars: Table[SymId, Cursor] # var -> to its init expression
     resultSym: SymId                   # symId of the `result` local for the current proc, or NoSymId
+    ownLocals: HashSet[SymId]          # locals DECLARED by the routine (or module
+                                       # toplevel) currently being analysed. A use
+                                       # of a foreign local — captured from an
+                                       # enclosing routine, or a module-level var
+                                       # read inside a proc — is outside this
+                                       # routine's init-proof obligations (a
+                                       # closure body runs at an unknowable time).
     activeBorrows: seq[BorrowInfo]
     verbose: bool                      # --verbose: dump final IR on init/contract
                                        # failures for easier debugging
@@ -758,7 +765,8 @@ proc traverseExpr(c: var NjvlContext; pc: var Cursor) =
     of Symbol:
       let symId = pc.symId
       let x = getLocalInfo(c.typeCache, symId)
-      if x.kind in {VarY, LetY, CursorY, PatternvarY, ResultY}:
+      if x.kind in {VarY, LetY, CursorY, PatternvarY, ResultY} and
+          symId in c.ownLocals:
         if c.tr.live and not isInitialized(c, symId):
           buildErr(c, pc.info, "cannot prove that " & pool.syms[symId] & " has been initialized")
           # don't report the same symbol twice from later references
@@ -1359,6 +1367,7 @@ proc traverseLocal(c: var NjvlContext; n: var Cursor) =
   let isInline = hasPragma(n, InlineP)
   skip n # pragmas
   c.typeCache.registerLocal(name, kind, n)
+  c.ownLocals.incl name
   let localType = n
   skip n # type
   if n.kind != DotToken or skipInitCheck:
@@ -1457,6 +1466,8 @@ proc traverseProc(c: var NjvlContext; n: var Cursor) =
   let oldInlineVars = move c.inlineVars
   let oldBorrows = move c.activeBorrows
   let oldProcStart = c.currentProcStart
+  let oldOwnLocals = move c.ownLocals
+  c.ownLocals = initHashSet[SymId]()
   c.currentProcStart = decl
   c.resultSym = NoSymId
   inc n
@@ -1514,6 +1525,7 @@ proc traverseProc(c: var NjvlContext; n: var Cursor) =
   c.resultSym = oldResultSym
   c.inlineVars = ensureMove oldInlineVars
   c.activeBorrows = ensureMove oldBorrows
+  c.ownLocals = ensureMove oldOwnLocals
   c.currentProcStart = oldProcStart
 
 proc traverseStmt(c: var NjvlContext; n: var Cursor) =
