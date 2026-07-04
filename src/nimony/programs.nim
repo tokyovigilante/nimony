@@ -329,6 +329,14 @@ type
     status*: LoadStatus
     decl*: Cursor
 
+var declLoadTransformer*: proc (buf: var TokenBuf) {.nimcall.} = nil
+  ## Applied to every decl `tryLoadSym` parses from another module's
+  ## index, before it is cached. Hexer installs `canonForeignDecl` here
+  ## so foreign decls arrive with closure types already lowered to the
+  ## `(tuple <proctype+env> (ref RootObj))` shape its own passes
+  ## produce. nil in sem and every other frontend — sem must see
+  ## sem-shaped decls.
+
 proc tryLoadSym*(s: SymId): LoadResult =
   if prog.mem.hasKey(s):
     result = LoadResult(status: LacksNothing, decl: cursorAt(prog.mem[s].buffer, 0))
@@ -350,6 +358,8 @@ proc tryLoadSym*(s: SymId): LoadResult =
         let seed = if indexEntry.parentInfo.file.isValid: indexEntry.parentInfo
                    else: m.rootInfo
         parse(m.reader, buf, parentSeed = seed, denseLineInfo = true)
+        if declLoadTransformer != nil:
+          declLoadTransformer(buf)
         let decl = cursorAt(buf, 0)
         prog.mem[s] = ToplevelEntry(buffer: ensureMove(buf), phase: SemcheckBodies)
         result = LoadResult(status: LacksNothing, decl: decl)

@@ -43,8 +43,8 @@ Hexer accepts Nimony's grammar.
 ]##
 
 import std / [parseopt, strutils, os, osproc, tables, assertions, syncio]
-import ".." / nimony / [langmodes, nifconfig]
-import lengcgen, lifter, duplifier, destroyer, inliner, constparams, dce2
+import ".." / nimony / [langmodes, nifconfig, programs]
+import lengcgen, lifter, duplifier, destroyer, inliner, constparams, dce2, coro_transform
 import ".." / lib / [vfs, nimversion]
 
 include ".." / lib / compat2
@@ -75,6 +75,10 @@ proc writeHelp() = quit(Usage, QuitSuccess)
 proc writeVersion() = quit(Version & "\n", QuitSuccess)
 
 proc handleCmdLine*() =
+  # Every hexer stage ("c", "d", "de") must see foreign decls with
+  # closure types already lowered — including the emit stage, whose
+  # typenav queries run against the module's post-hexer x.nif.
+  programs.declLoadTransformer = canonForeignDecl
   var files: seq[string] = @[]
   var bits = sizeof(int) * 8
   var bigEndian = false

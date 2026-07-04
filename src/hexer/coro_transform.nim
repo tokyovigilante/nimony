@@ -525,6 +525,181 @@ proc isLiftedClosureTuple*(n: Cursor): bool {.inline.} =
   n.typeKind == ClosureTupleT
 
 # ---------------------------------------------------------------------
+# Foreign-decl closure canonicalization
+# ---------------------------------------------------------------------
+#
+# Hexer lowers closure proctypes to `(tuple <proctype+env-param> (ref
+# RootObj))` per module (lambdalifting pass 2). Decls loaded from OTHER
+# modules' `.s.nif` indexes arrive sem-shaped, so without intervention
+# every consumer types the same symbol two ways: the producing module's
+# artifacts (x.nif, c.nif, extern C decls) say tuple, while the
+# consuming module's typenav says raw closure proctype — and the
+# consumer emits a direct call against the producer's tuple ABI.
+#
+# `canonForeignDecl` runs at the `tryLoadSym` boundary (installed as
+# `programs.declLoadTransformer` by hexer's main) and rewrites the
+# loaded decl's SIGNATURE and TYPE positions to the lifted shape:
+#
+# - closure proctypes / closure itertypes in type positions → the
+#   lifted tuple (exact same shape lambdalifting pass 2 emits, so
+#   structural type identity agrees across modules)
+# - `.closure` routine decls → env param appended (matching what the
+#   producer's pass 2 emitted into its own artifacts)
+# - bodies and value slots stay sem-level: the inliners splice them
+#   into the consumer's pipeline, which lowers them like local code.
+#
+# Generic decls (non-dot typevars) are left untouched: hexer only
+# codegens instances, which load as separate decls.
+
+proc canonClosureType*(dest: var TokenBuf; n: var Cursor)
+
+proc emitClosureProcTuple(dest: var TokenBuf; n: var Cursor) =
+  ## Consume a closure proctype (or a `.closure` routine decl used in
+  ## type position) at `n` and emit the lifted tuple. Mirrors
+  ## lambdalifting's `treProcType` closure branch.
+  let info = n.info
+  let inputKind = n.typeKind
+  dest.copyIntoKind ClosureTupleT, info:
+    dest.copyIntoKind ProctypeT, info:
+      dest.addDotToken() # nilability tag
+      n.into: # bound the walk: loaded decl bufs are sealed (elided ParRi)
+        if inputKind in {ProctypeT, ItertypeT}:
+          skip n # nilability tag
+        else:
+          skipRoutineDeclPrefix(n, inputKind)
+        dest.copyIntoKind ParamsU, info:
+          if n.substructureKind == ParamsU:
+            n.into:
+              while n.hasMore:
+                assert n.substructureKind == ParamU
+                takeInto dest, n: # param tag
+                  dest.takeTree n  # name
+                  dest.takeTree n  # exported
+                  dest.takeTree n  # pragmas
+                  canonClosureType dest, n # type
+                  dest.takeTree n  # default value
+          else:
+            assert n.kind == DotToken
+            inc n
+          addClosureEnvParam dest, info, SymId(0)
+        canonClosureType dest, n # return type
+        dest.takeTree n          # pragmas verbatim (keeps `(closure)`)
+        # decl-shaped inputs still carry effects/body slots — drop them:
+        while n.hasMore: skip n
+    dest.copyIntoKind RefT, info:
+      dest.addSymUse pool.syms.getOrIncl(BareRootObjName), info
+
+proc canonClosureType*(dest: var TokenBuf; n: var Cursor) =
+  ## Recursively rewrite closure proctypes / closure itertypes inside a
+  ## TYPE tree to the lifted tuple shape; everything else is copied.
+  if n.kind != TagLit:
+    dest.takeTree n
+  elif isLiftedClosureTuple(n):
+    # already the stable lowered shape — don't wrap twice (post-#2343 the
+    # probe keys on the ClosureTupleT tag; a TupleT can never match it)
+    dest.takeTree n
+  elif n.typeKind == ItertypeT and procHasPragma(n, ClosureP):
+    emitIterTupleTypeFromParams(dest, n, n.info)
+  elif n.typeKind in RoutineTypes and procHasPragma(n, ClosureP):
+    emitClosureProcTuple(dest, n)
+  else:
+    takeInto dest, n:
+      while n.hasMore:
+        canonClosureType(dest, n)
+
+proc containsClosurePragma(buf: var TokenBuf): bool =
+  # Raw token scan, not a cursor walk: under NIF27 bounded cursors a sealed
+  # subtree elides its ParRi tokens, so the old depth-counting walk never
+  # saw depth reach 0 and asserted (`c.rem != 0`) walking past the end.
+  result = false
+  for i in 0 ..< buf.len:
+    let t = buf[i]
+    if t.kind == TagLit and t.tagId.int == ord(ClosureP):
+      return true
+
+proc canonForeignDecl*(buf: var TokenBuf) =
+  ## `programs.declLoadTransformer` payload — see the section comment
+  ## above. Rewrites signature/type positions of a loaded foreign decl
+  ## to hexer's lowered closure shape; leaves bodies sem-level.
+  if not containsClosurePragma(buf):
+    return
+  var n = beginRead(buf)
+  var dest = createTokenBuf(buf.len + 8)
+  var replace = false
+  case n.stmtKind
+  of ProcS, FuncS, ConverterS, MethodS:
+    # generic decls stay untouched: hexer only codegens instances.
+    # Probe genericness BEFORE writing (the bounded takeInto walk below
+    # must consume the whole decl, so there is no mid-walk bail).
+    var probe = sub(n) # at name
+    skip probe # name -> export marker
+    skip probe # -> pattern
+    skip probe # -> typevars
+    if probe.substructureKind != TypevarsU:
+      let isClosureProc = procHasPragma(n, ClosureP)
+      let info = n.info
+      takeInto dest, n: # routine tag
+        dest.takeTree n  # name
+        dest.takeTree n  # export marker
+        dest.takeTree n  # pattern
+        dest.takeTree n  # typevars (dot)
+        if n.substructureKind == ParamsU:
+          takeInto dest, n:
+            while n.hasMore:
+              assert n.substructureKind == ParamU
+              takeInto dest, n: # param tag
+                dest.takeTree n  # name
+                dest.takeTree n  # exported
+                dest.takeTree n  # pragmas
+                canonClosureType dest, n # type
+                dest.takeTree n  # default value
+            if isClosureProc:
+              addClosureEnvParam dest, info, SymId(0)
+        else: # DotToken params
+          if isClosureProc:
+            dest.addParLe ParamsU, n.info
+            addClosureEnvParam dest, n.info, SymId(0)
+            dest.addParRi()
+            inc n
+          else:
+            dest.takeTree n
+        canonClosureType dest, n # return type
+        while n.hasMore:
+          dest.takeTree n # pragmas, effects, body — verbatim
+      replace = true
+  of GvarS, TvarS, VarS, LetS, ConstS:
+    takeInto dest, n: # local tag
+      dest.takeTree n  # name
+      dest.takeTree n  # export marker
+      dest.takeTree n  # pragmas
+      canonClosureType dest, n # type
+      while n.hasMore:
+        dest.takeTree n # value — verbatim
+    replace = true
+  of TypeS:
+    var probe = sub(n) # at name
+    skip probe # name -> export marker
+    skip probe # -> typevars
+    if probe.substructureKind != TypevarsU:
+      takeInto dest, n: # type tag
+        dest.takeTree n  # name
+        dest.takeTree n  # export marker
+        dest.takeTree n  # typevars (dot)
+        dest.takeTree n  # pragmas
+        canonClosureType dest, n # body
+        while n.hasMore:
+          dest.takeTree n
+      replace = true
+  else:
+    # templates/macros/iterators keep their sem shape: templates and
+    # macros are expanded already; `.closure` iterator decls are read
+    # raw by the coro machinery (`isClosureIterSym`, wrapper emission).
+    discard
+  endRead(n)
+  if replace:
+    buf = ensureMove dest
+
+# ---------------------------------------------------------------------
 # Predicates
 # ---------------------------------------------------------------------
 
