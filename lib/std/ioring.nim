@@ -196,8 +196,9 @@ proc armSlot(fd: cint) =
   if slot.registered:
     rearmFd(fd, addr slot.handler, evMask)
   else:
-    registerFd(fd, addr slot.handler, evMask)
+    # Mark registered BEFORE the epoll to prevent race.
     slot.registered = true
+    registerFd(fd, addr slot.handler, evMask)
 
 proc submitRead*(fd: cint; buf: pointer; len: int;
                  cont = Continuation(fn: nil, env: nil);
