@@ -3475,14 +3475,33 @@ proc semDelay(c: var SemContext; dest: var TokenBuf; it: var Item) =
   elif it.n.hasMore:
     # already-flattened (delay fn args…) form. This occurs when a generic
     # proc body — semchecked (and thus flattened by THIS proc) once during
-    # the first pass — is re-semmed during generic instantiation. `semDelay`
-    # must be idempotent: fn and args are already resolved direct children,
-    # so copy them straight through without re-stripping a call wrapper.
-    dest.addParLe(DelayX, info)
+    # the first pass — is re-semmed during generic instantiation. Unlike the
+    # first pass (where normal call-argument semchecking has already semmed the
+    # inner call before dispatching here), instantiation re-sem hands us the
+    # RAW generic `(delay fn args)` and never re-sems the delayed callee. A
+    # verbatim copy therefore leaves a generic delayed callee uninstantiated
+    # (e.g. `delay raceW(f, result)` with raceW a generic `.passive` proc stays
+    # `raceW.0.` instead of `raceW.0.I<hash>`), so hexer's coro transform skips
+    # it (`isConcrete == false`), no `.coro` frame type is emitted, and the
+    # backends assert in `loadForeign` ("Symbol not found").
+    # Reconstruct the call and re-sem it — exactly how the rest of the instance
+    # body is re-semmed — so the callee is instantiated for the current type
+    # args, then re-flatten to (delay fn args).
+    var callBuf = createTokenBuf(16)
+    callBuf.addParLe(CallX, info)
     while it.n.hasMore:
-      takeTree dest, it.n
+      takeTree callBuf, it.n           # fn + args → (call fn args)
+    callBuf.addParRi()
+    it.n = delayStart; skip it.n       # skip delay's )
+    var call = Item(n: cursorAt(callBuf, 0), typ: c.types.autoType)
+    var callDest = createTokenBuf(16)
+    semExpr c, callDest, call          # instantiates a generic callee
+    dest.addParLe(DelayX, info)
+    var semmed = cursorAt(callDest, 0)
+    semmed.into:                       # strip the (call …) wrapper
+      while semmed.hasMore:
+        takeTree dest, semmed
     dest.addParRi()
-    it.n = delayStart; skip it.n
   else:
     buildErr c, dest, it.n.info, "`delay` takes a call expression or no argument"
     skip it.n
