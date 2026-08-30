@@ -655,9 +655,23 @@ proc sqNeedsEnter(queue: var Queue; submit: int; flags: var EnterFlags): bool =
   return false;
 
 proc cqNeedsFlush(queue: var Queue): bool =
+  ## Whether the CQ needs an `io_uring_enter` with GETEVENTS before it can be
+  ## trusted: the kernel raises SQ_CQ_OVERFLOW when completions did not fit, and
+  ## SQ_TASKRUN when there is deferred completion work waiting for the owning
+  ## task to run it.
+  ##
+  ## EITHER flag, not both. This was `{SQ_CQ_OVERFLOW, SQ_TASKRUN} <= flags`,
+  ## which is a SUBSET test and so demanded both bits at once; liburing spells
+  ## the same thing `kflags & (IORING_SQ_CQ_OVERFLOW | IORING_SQ_TASKRUN)`.
+  ## Latent while rings were created with no setup flags — TASKRUN is rarely
+  ## raised on its own and overflow is rare — but it becomes total with
+  ## IORING_SETUP_DEFER_TASKRUN, where TASKRUN alone IS the normal signal:
+  ## GETEVENTS is then never passed, deferred completion work never runs, and
+  ## every operation stalls forever. Measured before this fix: a 200-connection
+  ## WebSocket cell delivered 0.0 MB/s with 100% of polls finding empty sockets.
   var sqFlags = atomicLoad(cast[ptr uint32](queue.sq.flags)[], moRelaxed)
-  return {SQ_CQ_OVERFLOW, SQ_TASKRUN} <= cast[ptr SqringFlags](sqFlags.addr)[]
-  # {SqCqOverflow, SqTaskrun} <= atomic_load_explicit(queue.sq.flags, moRelaxed)
+  let f = cast[ptr SqringFlags](sqFlags.addr)[]
+  return SQ_CQ_OVERFLOW in f or SQ_TASKRUN in f
 
 proc cqNeedsEnter(queue: var Queue): bool =
   SETUP_IOPOLL in queue.params.flags or queue.cqNeedsFlush
