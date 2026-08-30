@@ -24,15 +24,75 @@ const
   POLLIN = uint32(0x0001)
   POLLOUT = uint32(0x0004)
 
+const TunedSetupFlags: SetupFlags =
+  when defined(nimIoringPlainSetup): {}
+  else: {SETUP_COOP_TASKRUN}
+  ## What a worker lane's ring is created with. Every ring used to be created by
+  ## `newQueue(sqEntries)` — i.e. `defaultFlags`, i.e. `{}` — so the backend had
+  ## completion semantics instead of readiness semantics and none of the
+  ## behaviour that makes completions worth having.
+  ##
+  ## `COOP_TASKRUN` asks the kernel not to interrupt the owning task with an IPI
+  ## for every completion, letting them be run at the next ring transition
+  ## instead. It carries no constraint on who may submit, which is why it is the
+  ## only one here.
+  ##
+  ## **`SINGLE_ISSUER` and `DEFER_TASKRUN` are deliberately absent, and it is not
+  ## because they do not apply.** `DEFER_TASKRUN` is the flag that should matter
+  ## most for this backend — completion work would run when the owning task next
+  ## calls `io_uring_enter`, which is precisely what `iouringPoll` does every
+  ## pass — and it requires `SINGLE_ISSUER`. But `SINGLE_ISSUER` binds the ring
+  ## to a single submitting task, and the kernel fixes that task **when the ring
+  ## is created**, not when it is first used. These rings are created in
+  ## `tryInitLocalQueues`, on whichever thread called `initLoop()`, while each
+  ## worker lane is submitted from its own worker thread. Every worker's enter is
+  ## then refused.
+  ##
+  ## Measured: with `SINGLE_ISSUER` alone, a 4-connection WebSocket cell
+  ## delivered **0.0 MB/s** with 100% of reader polls finding an empty socket and
+  ## both socket queues empty — a total stall, and a **silent** one, which is the
+  ## worse half.
+  ##
+  ## Enabling them therefore means moving ring creation onto the thread that will
+  ## own it: each worker creates its lane's ring lazily on first use. That is a
+  ## backend change, not a flag, and it is the prerequisite for ever measuring
+  ## whether `DEFER_TASKRUN` helps us.
+  ##
+  ## NOT `SQPOLL` either: it runs one kernel polling thread **per ring**, and we
+  ## create `ioLanes()` rings — `workerCount + 1` kernel threads spinning, which
+  ## on a core-bound host costs more than it saves.
+  ##
+  ## `-d:nimIoringPlainSetup` restores the old empty set, so a regression can be
+  ## bisected to this decision rather than to the backend as a whole.
+
 var
   sqEntries: int
   localQueues: seq[Queue]
 
 proc tryInitLocalQueues(): bool =
   localQueues = @[]
+  # Whether the tuned flags are available is a property of the KERNEL, not of
+  # the lane, so it is asked once rather than `ioLanes()` times. `SINGLE_ISSUER`
+  # needs 6.0, `DEFER_TASKRUN` 6.1 and `COOP_TASKRUN` 5.19, and `io_uring_setup`
+  # answers an unsupported flag with -EINVAL rather than ignoring it — so asking
+  # unconditionally would turn a working older kernel into a hard startup
+  # failure. The probe ring is not thrown away: lane 0 is a worker lane, so this
+  # is exactly the ring lane 0 wanted.
+  var flags: SetupFlags = {}
+  if workerCount > 0:
+    try:
+      localQueues.add newQueue(sqEntries, TunedSetupFlags)
+      flags = TunedSetupFlags
+    except ErrorCode:
+      discard
   try:
-    for i in 0..<ioLanes():
-      localQueues.add newQueue(sqEntries)
+    while localQueues.len < ioLanes():
+      # Worker lanes have exactly one submitting thread. The TRAILING lane is
+      # shared by every non-worker submitter (see `ioLane`), so it gets none of
+      # the flags — `SINGLE_ISSUER` there would be a claim we cannot keep.
+      var f: SetupFlags = {}
+      if localQueues.len < workerCount: f = flags
+      localQueues.add newQueue(sqEntries, f)
   except ErrorCode as e:
     stderr.writeLine("ioring: failed to init io_uring queue: " & $e)
     return false
