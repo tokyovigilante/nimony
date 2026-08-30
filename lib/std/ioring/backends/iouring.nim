@@ -26,41 +26,37 @@ const
 
 const TunedSetupFlags: SetupFlags =
   when defined(nimIoringPlainSetup): {}
-  else: {SETUP_COOP_TASKRUN}
+  else: {SETUP_SINGLE_ISSUER, SETUP_COOP_TASKRUN}
   ## What a worker lane's ring is created with. Every ring used to be created by
-  ## `newQueue(sqEntries)` — i.e. `defaultFlags`, i.e. `{}` — so the backend had
+  ## `newQueue(sqEntries)` — `defaultFlags`, i.e. `{}` — so the backend had
   ## completion semantics instead of readiness semantics and none of the
   ## behaviour that makes completions worth having.
   ##
-  ## `COOP_TASKRUN` asks the kernel not to interrupt the owning task with an IPI
-  ## for every completion, letting them be run at the next ring transition
-  ## instead. It carries no constraint on who may submit, which is why it is the
-  ## only one here.
+  ## `SINGLE_ISSUER` declares what this backend already guarantees: a lane's ring
+  ## is submitted by exactly one thread. `COOP_TASKRUN` drops the per-completion
+  ## IPI, letting completion work run at the next ring transition instead. Both
+  ## are measured neutral on the loopback WebSocket matrix (27.9 MB/s, p95 159
+  ## against a no-flags control of 27.9 / 160) — enabled because they are
+  ## honest descriptions of this backend, not because loopback showed a win.
   ##
-  ## **`SINGLE_ISSUER` and `DEFER_TASKRUN` are deliberately absent, and it is not
-  ## because they do not apply.** `DEFER_TASKRUN` is the flag that should matter
-  ## most for this backend — completion work would run when the owning task next
-  ## calls `io_uring_enter`, which is precisely what `iouringPoll` does every
-  ## pass — and it requires `SINGLE_ISSUER`. But `SINGLE_ISSUER` binds the ring
-  ## to a single submitting task, and the kernel fixes that task **when the ring
-  ## is created**, not when it is first used. These rings are created in
-  ## `tryInitLocalQueues`, on whichever thread called `initLoop()`, while each
-  ## worker lane is submitted from its own worker thread. Every worker's enter is
-  ## then refused.
+  ## `SINGLE_ISSUER` binds the ring to its submitter **when the ring is
+  ## CREATED**, which is why `adoptLane` exists.
   ##
-  ## Measured: with `SINGLE_ISSUER` alone, a 4-connection WebSocket cell
-  ## delivered **0.0 MB/s** with 100% of reader polls finding an empty socket and
-  ## both socket queues empty — a total stall, and a **silent** one, which is the
-  ## worse half.
+  ## **`DEFER_TASKRUN` is not here yet, and not for lack of trying.** It is the
+  ## flag that should matter most — completion work would run when the owning
+  ## task next calls `io_uring_enter` rather than being pushed to it through
+  ## task_work — and `SINGLE_ISSUER` is its prerequisite, so it is now within
+  ## reach for the first time. Enabling it measures **0.8 MB/s against 27.9**,
+  ## with 94% of reader polls finding an empty socket: completions are barely
+  ## being reaped. Hoisting the `submit` out of the `n > 0` branch so that a poll
+  ## with nothing to submit still enters — the obvious first suspect, since
+  ## deferred work needs an enter to run — **does not fix it**, so something
+  ## further in the poll loop's contract with deferred completions is wrong and
+  ## is not yet diagnosed. Do not enable it without re-running the matrix.
   ##
-  ## Enabling them therefore means moving ring creation onto the thread that will
-  ## own it: each worker creates its lane's ring lazily on first use. That is a
-  ## backend change, not a flag, and it is the prerequisite for ever measuring
-  ## whether `DEFER_TASKRUN` helps us.
-  ##
-  ## NOT `SQPOLL` either: it runs one kernel polling thread **per ring**, and we
-  ## create `ioLanes()` rings — `workerCount + 1` kernel threads spinning, which
-  ## on a core-bound host costs more than it saves.
+  ## NOT `SQPOLL`: one kernel polling thread **per ring**, and we create
+  ## `ioLanes()` rings — `workerCount + 1` kernel threads spinning, which on a
+  ## core-bound host costs more than it saves.
   ##
   ## `-d:nimIoringPlainSetup` restores the old empty set, so a regression can be
   ## bisected to this decision rather than to the backend as a whole.
@@ -68,35 +64,57 @@ const TunedSetupFlags: SetupFlags =
 var
   sqEntries: int
   localQueues: seq[Queue]
+  laneAdopted: seq[bool]
+    ## Whether a lane's ring has been re-created by the thread that owns it.
+    ## Written only by that thread, on its first poll, and read by nobody else.
 
 proc tryInitLocalQueues(): bool =
+  ## Create every lane's ring PLAINLY, on whatever thread is calling. Worker
+  ## lanes are re-created later by their own thread — see `adoptLane`.
   localQueues = @[]
-  # Whether the tuned flags are available is a property of the KERNEL, not of
-  # the lane, so it is asked once rather than `ioLanes()` times. `SINGLE_ISSUER`
-  # needs 6.0, `DEFER_TASKRUN` 6.1 and `COOP_TASKRUN` 5.19, and `io_uring_setup`
-  # answers an unsupported flag with -EINVAL rather than ignoring it — so asking
-  # unconditionally would turn a working older kernel into a hard startup
-  # failure. The probe ring is not thrown away: lane 0 is a worker lane, so this
-  # is exactly the ring lane 0 wanted.
-  var flags: SetupFlags = {}
-  if workerCount > 0:
-    try:
-      localQueues.add newQueue(sqEntries, TunedSetupFlags)
-      flags = TunedSetupFlags
-    except ErrorCode:
-      discard
+  laneAdopted = newSeq[bool](ioLanes())
   try:
     while localQueues.len < ioLanes():
-      # Worker lanes have exactly one submitting thread. The TRAILING lane is
-      # shared by every non-worker submitter (see `ioLane`), so it gets none of
-      # the flags — `SINGLE_ISSUER` there would be a claim we cannot keep.
-      var f: SetupFlags = {}
-      if localQueues.len < workerCount: f = flags
-      localQueues.add newQueue(sqEntries, f)
+      localQueues.add newQueue(sqEntries, {})
   except ErrorCode as e:
     stderr.writeLine("ioring: failed to init io_uring queue: " & $e)
     return false
   return true
+
+proc adoptLane(lane: int) {.inline.} =
+  ## Re-create this lane's ring on the thread that will own it, once.
+  ##
+  ## **Why a ring is thrown away to do this.** `SINGLE_ISSUER` — and so
+  ## `DEFER_TASKRUN`, which requires it — fixes the ring's submitting task when
+  ## `io_uring_setup` runs, not when the ring is first used. Rings are created in
+  ## `tryInitLocalQueues` on whichever thread called `initLoop()`, while a worker
+  ## lane is submitted only ever by its own worker, so a ring created there and
+  ## submitted here is refused. Creating it here instead is the whole fix:
+  ## measured with `SINGLE_ISSUER`, a 4-connection cell went from **0.0 MB/s with
+  ## 100% of reader polls finding an empty socket** to 27.9 MB/s at p95 159 —
+  ## indistinguishable from the no-flags control.
+  ##
+  ## **Why replace rather than create lazily into an empty slot.** A `Queue` owns
+  ## a fd and three mappings and has no valid zero state — `newSeq[Queue]` cannot
+  ## build one — so `seq[Queue]` cannot carry a hole. Assigning over the slot
+  ## destroys the plain ring and installs the owned one, which costs one unused
+  ## ring per worker at startup and keeps the type honest everywhere else.
+  ##
+  ## The trailing lane is deliberately skipped: `ioLane()` hands it to every
+  ## non-worker submitter, so no single thread can claim it and `SINGLE_ISSUER`
+  ## there would be a promise we cannot keep.
+  ##
+  ## A refusal (kernel too old — `SINGLE_ISSUER` needs 6.0, `DEFER_TASKRUN` 6.1,
+  ## `COOP_TASKRUN` 5.19, and `io_uring_setup` answers `-EINVAL` rather than
+  ## ignoring an unknown flag) simply leaves the plain ring in place.
+  if not laneAdopted[lane]:
+    laneAdopted[lane] = true
+    when not defined(nimIoringPlainSetup):
+      if lane < workerCount:
+        try:
+          localQueues[lane] = newQueue(sqEntries, TunedSetupFlags)
+        except ErrorCode:
+          discard
 
 proc fillSqe(sqe: ptr Sqe; op: ptr OpContext) {.inline.} =
   case op.kind
@@ -131,6 +149,7 @@ proc iouringPoll(timeoutMs: int): bool {.nimcall.} =
   # worker inside poll() forever — the outer worker loop also runs task
   # draining, and remaining deferred entries are picked up next iteration.
   let lane = ioLane()
+  adoptLane(lane)
   var buf {.noinit.}: array[DrainBatch, OpContext]
   var n = gOpQueues[lane].tryBulkDequeue(DrainBatch, buf)
   if n > 0:
