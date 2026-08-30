@@ -674,8 +674,17 @@ proc cqNeedsFlush(queue: var Queue): bool =
   return SQ_CQ_OVERFLOW in f or SQ_TASKRUN in f
 
 proc cqNeedsEnter(queue: var Queue): bool =
-  SETUP_IOPOLL in queue.params.flags or queue.cqNeedsFlush
-  # SetupIopoll in queue.params.flags or queue.cqNeedsFlush
+  ## Whether reaping completions requires an `io_uring_enter` with GETEVENTS.
+  ##
+  ## `DEFER_TASKRUN` is unconditional here, and that is the whole point of the
+  ## flag: on such a ring the kernel runs completion work ONLY when the owning
+  ## task enters, so the application is the only thing that can make a CQE
+  ## appear. Waiting for `cqNeedsFlush` to say so does not work — measured with
+  ## `TASKRUN_FLAG` also set, `SQ_TASKRUN` was raised on 5 of 173 submits, so the
+  ## flag is not a signal a DEFER ring can be driven from.
+  SETUP_IOPOLL in queue.params.flags or
+    SETUP_DEFER_TASKRUN in queue.params.flags or
+    queue.cqNeedsFlush
 
 proc submit*(queue: var Queue; waitNr: uint = 0): int {.raises, tags: [], discardable.} =
   ## Submit sqes acquired from queue.getSqe() to the kernel.

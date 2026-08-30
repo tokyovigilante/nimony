@@ -26,6 +26,8 @@ const
 
 const TunedSetupFlags: SetupFlags =
   when defined(nimIoringPlainSetup): {}
+  elif defined(nimIoringDeferTaskrun):
+    {SETUP_SINGLE_ISSUER, SETUP_DEFER_TASKRUN, SETUP_COOP_TASKRUN}
   else: {SETUP_SINGLE_ISSUER, SETUP_COOP_TASKRUN}
   ## What a worker lane's ring is created with. Every ring used to be created by
   ## `newQueue(sqEntries)` — `defaultFlags`, i.e. `{}` — so the backend had
@@ -33,30 +35,32 @@ const TunedSetupFlags: SetupFlags =
   ## behaviour that makes completions worth having.
   ##
   ## `SINGLE_ISSUER` declares what this backend already guarantees: a lane's ring
-  ## is submitted by exactly one thread. `COOP_TASKRUN` drops the per-completion
-  ## IPI, letting completion work run at the next ring transition instead. Both
-  ## are measured neutral on the loopback WebSocket matrix (27.9 MB/s, p95 159
-  ## against a no-flags control of 27.9 / 160) — enabled because they are
-  ## honest descriptions of this backend, not because loopback showed a win.
+  ## is submitted by exactly one thread. It binds the ring to that thread **when
+  ## the ring is CREATED**, which is why `adoptLane` exists. `COOP_TASKRUN` drops
+  ## the per-completion IPI. Both measure neutral on the loopback WebSocket
+  ## matrix (27.9 MB/s, p95 159 against a no-flags control of 27.9 / 160) and are
+  ## enabled because they are honest descriptions of this backend.
   ##
-  ## `SINGLE_ISSUER` binds the ring to its submitter **when the ring is
-  ## CREATED**, which is why `adoptLane` exists.
+  ## **`DEFER_TASKRUN` works, and is off by default.** It needed three things,
+  ## all now in place: the ring created by its owner (`adoptLane`), an enter on
+  ## every poll rather than only when SQEs were filled, and `cqNeedsEnter`
+  ## treating a DEFER ring as always needing GETEVENTS — because `SQ_TASKRUN` is
+  ## not a usable signal here (raised on 5 of 173 submits even with
+  ## `TASKRUN_FLAG` also set). With those it runs at 27.9 MB/s and p95 159,
+  ## indistinguishable from the control; without them it ran at 0.8.
   ##
-  ## **`DEFER_TASKRUN` is not here yet, and not for lack of trying.** It is the
-  ## flag that should matter most — completion work would run when the owning
-  ## task next calls `io_uring_enter` rather than being pushed to it through
-  ## task_work — and `SINGLE_ISSUER` is its prerequisite, so it is now within
-  ## reach for the first time. Enabling it measures **0.8 MB/s against 27.9**,
-  ## with 94% of reader polls finding an empty socket: completions are barely
-  ## being reaped. Hoisting the `submit` out of the `n > 0` branch so that a poll
-  ## with nothing to submit still enters — the obvious first suspect, since
-  ## deferred work needs an enter to run — **does not fix it**, so something
-  ## further in the poll loop's contract with deferred completions is wrong and
-  ## is not yet diagnosed. Do not enable it without re-running the matrix.
+  ## It stays off because the loopback matrix cannot show what it is for, and it
+  ## is not free: on a DEFER ring the application is the only thing that can run
+  ## completion work, so every poll must enter. Measured over one window, 173
+  ## enters became 43,634 — roughly one syscall per poll instead of one per op
+  ## batch. On a busy worker that is a syscall it was making anyway; on an idle
+  ## one it is added to the poll interval rather than replacing it. The natural
+  ## pairing is a poll that *waits* inside that same enter, which is what
+  ## `submitAndWait` on `fix/iouring-blocking-wait` does — land them together and
+  ## decide on the real link, not here.
   ##
-  ## NOT `SQPOLL`: one kernel polling thread **per ring**, and we create
-  ## `ioLanes()` rings — `workerCount + 1` kernel threads spinning, which on a
-  ## core-bound host costs more than it saves.
+  ## `-d:nimIoringDeferTaskrun` turns it on. NOT `SQPOLL`: one kernel polling
+  ## thread **per ring**, and we create `ioLanes()` rings.
   ##
   ## `-d:nimIoringPlainSetup` restores the old empty set, so a regression can be
   ## bisected to this decision rather than to the backend as a whole.
@@ -174,10 +178,24 @@ proc iouringPoll(timeoutMs: int): bool {.nimcall.} =
       # `addr op.acceptAddr`/`addr op.acceptLen` and the kernel writes through
       # those at completion time, long after this stack frame is gone.
       fillSqe(sqe, addr gSlots[lane].slots[idx].op)
-    try:
-      discard localQueues[lane].submit()
-    except ErrorCode as e:
-      quit "fatal: bug: submit cannot fail: " & $e
+  # ONE enter per poll, whether or not anything was just filled.
+  #
+  # This sat inside the `n > 0` branch, which was correct while the ring behaved
+  # like a readiness poller: the kernel pushed completions into the CQ through
+  # task_work, so a poll with nothing to submit could still read `cqReady` and
+  # find them. On a `DEFER_TASKRUN` ring it cannot — completion work runs only
+  # when the owning task enters — so a poll that submits nothing reaps nothing,
+  # and the connection advances only when some unrelated op happens to force an
+  # enter. Measured with it still inside the branch: 173 submits in 80,000 polls
+  # and 0.8 MB/s against 27.9.
+  #
+  # `submit` still decides whether a syscall is needed: on a plain ring, with
+  # nothing to submit and no SQ_TASKRUN/SQ_CQ_OVERFLOW raised, it returns without
+  # entering.
+  try:
+    discard localQueues[lane].submit()
+  except ErrorCode as e:
+    quit "fatal: bug: submit cannot fail: " & $e
   if localQueues[lane].cqReady > 0:
     var cqes {.noinit.}: array[DrainBatch, Cqe]
     try:
