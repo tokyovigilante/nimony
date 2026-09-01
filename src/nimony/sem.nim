@@ -3462,14 +3462,27 @@ proc semDelay(c: var SemContext; dest: var TokenBuf; it: var Item) =
     dest.addParLe(Delay0X, info)
     dest.addParRi()
     it.n = delayStart; skip it.n
-  elif it.n.exprKind in CallKinds:
-    # delay(call) form: produce (delay fn args)
+  elif it.n.exprKind in CallKinds and (var probe = it.n; skip probe; not probe.hasMore):
+    # delay(call) form: the inner call is delay's SOLE child (the original,
+    # not-yet-flattened shape). Produce (delay fn args) by stripping the call
+    # wrapper.
     dest.addParLe(DelayX, info)
     it.n.into:                         # descend past inner call's tag
       while it.n.hasMore:
         takeTree dest, it.n            # copy fn and args verbatim (already semchecked)
     dest.addParRi()
     it.n = delayStart; skip it.n       # skip outer delay's )
+  elif it.n.hasMore:
+    # already-flattened (delay fn args…) form. This occurs when a generic
+    # proc body — semchecked (and thus flattened by THIS proc) once during
+    # the first pass — is re-semmed during generic instantiation. `semDelay`
+    # must be idempotent: fn and args are already resolved direct children,
+    # so copy them straight through without re-stripping a call wrapper.
+    dest.addParLe(DelayX, info)
+    while it.n.hasMore:
+      takeTree dest, it.n
+    dest.addParRi()
+    it.n = delayStart; skip it.n
   else:
     buildErr c, dest, it.n.info, "`delay` takes a call expression or no argument"
     skip it.n
