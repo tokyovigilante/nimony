@@ -204,10 +204,19 @@ proc trFailed(c: var Context; dest: var TokenBuf; n: var Cursor) =
     if localIsVoid:
       dest.takeTree n
     else:
-      assert n.kind == Symbol
       copyIntoKind dest, TupatX, info:
-        dest.addSymUse n.symId, info
-        inc n
+        if n.kind == Symbol:
+          # bare tuple-local: raw sym use (deliberately bypasses the tupleVars
+          # -> (tupat sym 1) rewrite in `tr`).
+          dest.addSymUse n.symId, info
+          inc n
+        else:
+          # coro-lowered lifted local: the passive-proc transform replaced the
+          # bare symbol with a fully-lowered field access `(dot (deref env)
+          # field)`. Copy it VERBATIM — re-running `tr` here would misfire (the
+          # lifted `result` field is a result-sym that `tr` rewrites, injecting a
+          # spurious extra deref). This lvalue needs no const-param treatment.
+          dest.takeTree n
         dest.addIntLit 0, info
   c.nextRaiseIsSpecial = true
 
