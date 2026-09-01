@@ -3506,7 +3506,14 @@ proc semSuspend(c: var SemContext; dest: var TokenBuf; it: var Item) =
     buildErr c, dest, it.n.info, "`suspend` takes no argument"
     skip it.n
     it.n = suspendStart; skip it.n
-  it.typ = c.types.continuationType
+  # `suspend` is declared `{.magic: "Suspend".}` with a VOID return type. The
+  # first sem pass never routes through here (SuspendX isn't in
+  # MagicCallNeedsSemcheck), so it types the call as void. Generic-instantiation
+  # re-sem DOES dispatch SuspendX here, so we must produce the same void type —
+  # otherwise the re-semmed `(suspend)` looks like a non-void expression and the
+  # discard check fires ("expression of type Continuation must be discarded"),
+  # breaking every generic `.passive` proc that suspends (e.g. a generic race).
+  it.typ = c.types.voidType
   commonType c, dest, it, beforeExpr, expected
 
 type ArrayConstrContext = object
