@@ -97,6 +97,26 @@ proc poolLive*(): bool {.inline.} =
   ## `passiveWait`).
   not atomicLoad(stopFlag, moRelaxed) and atomicLoad(liveWorkers, moRelaxed) > 0
 
+# --- Back-off helpers for non-worker threads ---
+
+when not defined(windows):
+  proc sched_yield(): cint {.importc: "sched_yield", sideEffect.}
+
+proc yieldThread() =
+  when defined(windows):
+    sleep(0'u32)
+  else:
+    discard sched_yield()
+
+proc napMicros(us: int) =
+  when defined(windows):
+    sleep(1'u32)
+  else:
+    var ts = Timespec(tv_sec: Time(us div 1_000_000),
+                      tv_nsec: clong((us mod 1_000_000) * 1000))
+    var rem = Timespec()
+    discard nanosleep(ts, rem)
+
 # --- Submit / dequeue ---
 
 proc tryEnqueue(s: int; t: Task): bool {.inline.} =
@@ -104,25 +124,46 @@ proc tryEnqueue(s: int; t: Task): bool {.inline.} =
   let i = s mod workerCount
   return localQueues[i].tryEnqueue(t)
 
-proc submit*(t: Task; h = 0) =
-  ## Submit a task to the pool. **Non-lossy with "caller-runs" backpressure:**
-  ## try the hinted stripe, then the others (absorbing bursts); if *every*
-  ## stripe is full, run the continuation inline — trampolining it on the
-  ## calling thread and handing the remainder back to the pool the moment a
-  ## slot frees — rather than dropping it or blocking.
-  ##
-  ## Why caller-runs and not a blocking wait: workers re-submit continuations
-  ## from inside the trampoline (see `workerLoop`). A blocking `submit` could
-  ## park every worker on a full queue with none left to drain it -> deadlock.
-  ## Caller-runs instead guarantees forward progress (a producer that outruns
-  ## the pool simply does the work), so the queue stays bounded at
-  ## `StripeCount*StripeSize` and no submitter ever stalls.
-  workerMetrics[threadIdx].tasksSubmited += 1
-  if tryEnqueue(h, t): return
+proc tryEnqueueAny(t: Task; h: int): bool {.inline.} =
+  ## Stripes (hinted one first), then the inject queue.
+  if tryEnqueue(h, t): return true
   for off in 1 ..< workerCount:
     workerMetrics[threadIdx].enqueueMiss += 1
-    if tryEnqueue(h + off, t): return
-  if injectQueue.tryEnqueue(t): return
+    if tryEnqueue(h + off, t): return true
+  result = injectQueue.tryEnqueue(t)
+
+proc submit*(t: Task; h = 0) =
+  ## Submit a task to the pool. **Non-lossy with backpressure:** try the hinted
+  ## stripe, then the others (absorbing bursts), then the inject queue. If
+  ## *every* queue is full:
+  ##
+  ## * on a **worker**, run the continuation inline ("caller-runs") —
+  ##   trampolining it on the calling thread and handing the remainder back to
+  ##   the pool the moment a slot frees — rather than dropping it or blocking.
+  ## * on a **non-worker** while the pool is live (`poolLive`), wait for a slot
+  ##   (spin, yield, then 50 us naps) and enqueue. A foreign thread never runs
+  ##   shared pool tasks inline: they may take locks or arm I/O that only the
+  ##   pool is meant to touch.
+  ##
+  ## Why workers cannot block: they re-submit continuations from inside the
+  ## trampoline (see `workerLoop`). A blocking `submit` could park every worker
+  ## on a full queue with none left to drain it -> deadlock. Caller-runs
+  ## instead guarantees forward progress, so the queue stays bounded at
+  ## `StripeCount*StripeSize`. A non-worker's wait is safe because workers never
+  ## wait on a non-worker: the queues are emptied by workers alone, so a slot
+  ## frees as long as one worker is alive (`poolLive`); once none is, a
+  ## non-worker falls back to caller-runs so nothing hangs.
+  workerMetrics[threadIdx].tasksSubmited += 1
+  if tryEnqueueAny(t, h): return
+  if not isWorker and poolLive():
+    var spins = 0
+    while true:
+      if spins < 64: cpuRelax()
+      elif spins < 128: yieldThread()
+      else: napMicros(50)
+      inc spins
+      if tryEnqueueAny(t, h): return
+      if not poolLive(): break
   # Saturated: run it here. `c.fn` returns the next continuation, or one whose
   # `fn` is nil when the task completes or parks (I/O will resume a parked one).
   var c = t.con
