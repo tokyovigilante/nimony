@@ -142,7 +142,8 @@ When a coroutine **parks** (`suspend()` returns `Continuation(fn: nil, env: fram
    or the loop above on the captured resume continuation).
 
 A park never ends a call made from a regular proc: that caller keeps waiting (and, with
-the thread pool running, keeps doing a worker's turn — `setPassiveWaitHook`) until the
+the thread pool running, keeps waiting through `setPassiveWaitHook`: a pool worker does a
+worker's turn, any other thread follows the non-worker rule below) until the
 callee's last state has run. So a regular proc between two passive calls holds its
 hardware stack frame for as long as its callee is parked, exactly like a blocking call.
 
@@ -372,8 +373,8 @@ complete(contVar)
 last state does, on whichever thread resumed it — marks the call as done. `complete`
 first trampolines on this thread; if the callee parked, it then waits for that mark,
 calling the wait hook meanwhile (`setPassiveWaitHook`). The thread pool installs one
-that does a worker's turn: run queued tasks and poll this thread's I/O lane — which is
-required, since a non-worker's ring ops complete only through its own poll.
+that does a worker's turn on a pool worker: run queued tasks and poll the worker's I/O
+lane. A thread that is not a pool worker follows the rule in "Non-worker waits" below.
 
 The wait is not optional. The frame and the callee's result pointer both point into the
 regular caller's stack frame, so returning while the callee is parked would leave it
@@ -389,6 +390,57 @@ pool (`submit`); a park is then the scheduler's (or the caller's) business to re
 Note: This optimization only applies to regular procedure calls. For
 passive methods, dynamic dispatch prevents the inlining strategy above,
 so we must still call via the wrapper and allocate on heap.
+
+### Non-worker waits
+
+A thread that is not a pool worker (the main thread, a render thread, a library's own
+thread) is a guest of the pool. While the pool is **live** (at least one worker thread
+is running and `shutdownPool` has not been called):
+
+* Its wait in `complete()` — the pool's `passiveWait` hook — polls **only its own I/O
+  lane**. It never dequeues from the shared stripes or the inject queue and never runs a
+  pool task. Tasks on the shared stripes are the workers' business: they may take locks
+  or arm I/O on the lane of whichever thread runs them, and a foreign thread running
+  one would leave that continuation on the shared trailing lane, which no worker drains.
+* A completion on its own lane during that poll is not sent to the pool. The backend
+  keeps the continuation on a thread-local *own-ready* list, and the same `passiveWait`
+  call runs it after the poll returns (never inside the poll) and before it returns:
+  each continuation is trampolined until it parks or finishes. A callee parked on the
+  waiter's own I/O therefore resumes on the waiter within one poll, as before.
+  The redirect applies only inside that one `reactorPoll(0|1)` of the non-worker wait. A
+  `pumpIo`/`runLoop` drive, `pollCompletions`, the backpressure poll in `enqueueOp`,
+  `closeFd`/`submitPollRemove` and the parfor join poll all still submit the
+  continuation to the pool.
+* Between polls it backs off: about 20 us of spinning, then about 200 us of
+  `sched_yield`, then 1 ms waits in the reactor (or a 1 ms nap behind a reactor that
+  only peeks). Any work on its own lane resets the back-off. So a callee finished by a
+  worker is noticed within a spin or yield, not a millisecond.
+* `submit` from such a thread, when every stripe and the inject queue are full, **waits
+  for a slot** (spin, yield, then 50 us naps) instead of running the continuation
+  inline ("caller-runs"). Workers keep caller-runs: they re-submit from inside the
+  trampoline and a blocking worker could deadlock the pool.
+
+Why this cannot deadlock: workers never wait on a non-worker, so every task a
+non-worker waits for sits on a shared stripe or a worker lane, which workers drain,
+and the stripes are emptied by workers alone, so a full queue frees as long as one
+worker is alive. This holds for any worker count, including a worker that is itself in
+`passiveWait` (a worker's wait still does a worker's turn). The non-worker's own ring
+operations are still polled by itself. A non-worker that submitted the only
+continuation able to finish what it waits on, while the pool is saturated with tasks
+that wait on that non-worker, is excluded by "workers never wait on a non-worker".
+
+If the pool is **not live** (`shutdownPool` was called, or no worker thread could be
+started) there is nobody else to run the tasks, so a non-worker falls back to the
+earlier behaviour: its wait does a worker's turn and a saturated `submit` runs the
+continuation inline. `poolLive()` answers which case applies.
+
+Two limits stay. All non-worker threads share one trailing lane, so the ring supports
+one foreign submitter at a time (see `ioLane`); two interdependent continuation-bearing
+ops on that lane can still deadlock when drained by the one waiter, in the order the
+lane completes them. And a `||` loop's join (`parWait`) on a non-worker still helps
+with pool work (`poolHelp`) by design: the main thread is a full participant in
+parallel loops. Avoid joining a `||` loop from a non-pool thread when the pool also
+runs code that must not execute on that thread.
 
 ### The `callee` field
 
