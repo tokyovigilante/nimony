@@ -75,6 +75,27 @@ var gReactorWaits* = false
   ## to do the sleeping itself, because a reactor that only peeks would
   ## otherwise leave the loop spinning on a core.
 var threadIdx* {.threadvar.}: int
+var isWorker {.threadvar.}: bool
+  # Only workers may stage; foreign threads must enqueue directly or their
+  # batch could never be flushed.
+
+var
+  liveWorkers: int
+    ## Atomic. Worker threads that were actually started and have not exited.
+    ## `initPool` swallows thread-creation failures, so `workerCount` alone does
+    ## not say whether anyone is draining the stripes. A non-worker only stops
+    ## running pool tasks itself (see `poolLive`) while this is positive.
+  poolTestWorkerLimit*: int = -1
+    ## Test hook: when non-negative, `initPool` starts at most this many worker
+    ## threads (0 simulates every thread creation failing). Set it before the
+    ## first `initPool`.
+
+proc poolLive*(): bool {.inline.} =
+  ## True while at least one worker is running and the pool has not been shut
+  ## down. Non-worker threads leave the shared stripes to the workers only while
+  ## this holds; otherwise nobody else would run the tasks (see `submit`,
+  ## `passiveWait`).
+  not atomicLoad(stopFlag, moRelaxed) and atomicLoad(liveWorkers, moRelaxed) > 0
 
 # --- Submit / dequeue ---
 
@@ -126,7 +147,6 @@ type
 
 var
   staged {.threadvar.}: StagedTasks
-  isWorker {.threadvar.}: bool # only workers may stage; foreign threads must enqueue directly or their batch could never be flushed
 
 proc stageTask(t: Task): bool {.inline.} =
   ## Push onto this worker's private ring; false when it is full.
@@ -216,6 +236,23 @@ proc drainOnce(startStripe: int): bool =
       workerMetrics[threadIdx].dequeueMiss += 1
   result = false
 
+proc poolQueueStats*(): tuple[queued, capacity, injected: int] =
+  ## Tasks currently sitting in the shared stripes and the inject queue
+  ## (`queued`, of which `injected` are in the inject queue), and the number
+  ## the queues can hold in all (`capacity`). Takes each stripe's lock; meant
+  ## for tests and diagnostics, not for hot paths.
+  result = (queued: 0, capacity: 0, injected: 0)
+  for i in 0 ..< workerCount:
+    acquireSys(localQueues[i].lock)
+    result.queued += localQueues[i].count
+    result.capacity += localQueues[i].data.len
+    releaseSys(localQueues[i].lock)
+  acquireSys(injectQueue.lock)
+  result.queued += injectQueue.count
+  result.injected = injectQueue.count
+  result.capacity += injectQueue.data.len
+  releaseSys(injectQueue.lock)
+
 proc poolHelp*(): bool {.inline.} =
   drainOnce(0)
 
@@ -290,6 +327,7 @@ proc workerLoop(arg: pointer) {.nimcall.} =
         idleTicks = 0
         sinceCollect = 0
         miCollect(true)
+  discard atomicFetchSub(liveWorkers, 1, moRelaxed)
 
 # --- Lifecycle ---
 
@@ -315,11 +353,16 @@ proc initPool*(count = 0) =
       localQueues[i].init(StripeSize)
     injectQueue.init(StripeSize*16)
     workers.setLen(workerCount)
-    for i in 0 ..< workerCount:
+    let toStart = if poolTestWorkerLimit >= 0: min(poolTestWorkerLimit, workerCount)
+                  else: workerCount
+    # Before the first thread exists, so a worker that exits at once cannot
+    # drive the count negative; a failed `create` gives its share back.
+    atomicStore(liveWorkers, toStart, moRelaxed)
+    for i in 0 ..< toStart:
       try:
         create workers[i], workerLoop, cast[pointer](i)
       except:
-        discard
+        discard atomicFetchSub(liveWorkers, 1, moRelaxed)
     atomicStore(poolState, 2, moRelease)
   else:
     while atomicLoad(poolState, moAcquire) != 2:
