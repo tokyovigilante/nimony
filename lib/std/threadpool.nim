@@ -339,13 +339,100 @@ proc workCycle(stripe: int): bool =
       var rem = Timespec()
       discard nanosleep(ts, rem)
 
+# --- Non-worker waits ---
+#
+# A thread that is not a pool worker and waits for a parked `.passive` call
+# (`complete`) polls only its OWN I/O lane and never pops tasks off the shared
+# stripes while the pool is live: those tasks belong to the workers (they may
+# take locks, or arm I/O on the lane of the thread that runs them), and a
+# foreign thread running one would put its continuation on a lane no worker
+# drains. See doc/passive_procs.md, "Non-worker waits".
+
+var
+  inOwnWait {.threadvar.}: bool
+    ## True only while a live-pool non-worker `passiveWait` is inside its own
+    ## `reactorPoll`. Gates `deferOwnReady`.
+  ownReady {.threadvar.}: seq[Continuation]
+    ## Continuations of ops this non-worker submitted on its own lane that
+    ## completed during its `passiveWait` poll. Run by that `passiveWait` after
+    ## the poll returns, never inside it (no reactor re-entry).
+  ownRedirects {.threadvar.}: int
+  idleCalls {.threadvar.}: int
+    ## Consecutive fruitless non-worker `passiveWait` calls; picks the back-off.
+
+const
+  SpinCalls = 10    ## calls that only spin (~2 us each) ~ 20 us
+  YieldCalls = 40   ## calls that yield the CPU once each ~ 200 us
+  RelaxPerCall = 32
+
+proc deferOwnReady*(c: Continuation): bool =
+  ## Called by the I/O backend when an op with continuation `c` completes. On a
+  ## non-worker inside its own `passiveWait` poll the continuation is kept for
+  ## that thread (returns true); everywhere else the caller submits it to the
+  ## pool as before (returns false).
+  if inOwnWait and not isWorker:
+    ownReady.add c
+    inc ownRedirects
+    result = true
+  else:
+    result = false
+
+proc ownWaitRedirects*(): int =
+  ## Test seam: how many completions this thread has kept via `deferOwnReady`.
+  ownRedirects
+
+proc inOwnWaitNow*(): bool =
+  ## Test seam: is this thread inside a non-worker `passiveWait` poll?
+  inOwnWait
+
+proc ownLanePoll(timeoutMs: cint): bool =
+  ## Poll this thread's own lane, then run the continuations that completed
+  ## there. Answers whether anything happened.
+  assert not inOwnWait
+  inOwnWait = true
+  result = reactorPoll(timeoutMs)
+  inOwnWait = false
+  # The flag is clear from here on, so a nested pumpIo/closeFd/backpressure
+  # poll in a continuation below submits to the pool as it always did. A
+  # nested `passiveWait` drains whatever it adds before it returns.
+  while ownReady.len > 0:
+    var taken: seq[Continuation] = @[]
+    swap(taken, ownReady)
+    result = true
+    for i in 0 ..< taken.len:
+      var c = taken[i]
+      while c.fn != nil:
+        c = c.fn(c.env)
+
+proc nonWorkerWait() =
+  let n = idleCalls
+  let late = n >= SpinCalls + YieldCalls
+  if ownLanePoll(if late: 1.cint else: 0.cint):
+    idleCalls = 0
+    return
+  inc idleCalls
+  if n < SpinCalls:
+    for _ in 0 ..< RelaxPerCall: cpuRelax()
+  elif n < SpinCalls + YieldCalls:
+    yieldThread()
+  elif not gReactorWaits:
+    napMicros(1000)
+
 proc passiveWait() {.nimcall.} =
   ## `system.setPassiveWaitHook`: a thread waiting for a parked `.passive` call
-  ## to finish does a worker's turn. It must: a non-worker's I/O ops sit on a
-  ## lane that only its own poll drains (`ioLane`), so the op its callee parked
-  ## on completes nowhere else — and a worker that waited idly could be the one
-  ## the pool needed to resume the callee.
-  discard workCycle(if isWorker: threadIdx else: 0)
+  ## to finish keeps the pool moving. A worker does a worker's turn: a worker
+  ## that waited idly could be the one the pool needed to resume the callee.
+  ##
+  ## A non-worker polls its own lane only (its I/O ops complete nowhere else,
+  ## see `ioLane`) and leaves the shared stripes to the workers, which never wait
+  ## on a non-worker. If no worker is alive (`poolLive`) it does a worker's turn
+  ## as before, so nothing that progressed then hangs now.
+  if isWorker:
+    discard workCycle(threadIdx)
+  elif poolLive():
+    nonWorkerWait()
+  else:
+    discard workCycle(0)
 
 proc workerLoop(arg: pointer) {.nimcall.} =
   threadIdx = cast[int](arg)

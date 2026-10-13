@@ -217,7 +217,10 @@ proc complete*(slotIdx: int; res: int) =
   let kind  = slot.op.kind
   gSlots[lane].freeSlot(slotIdx)
   if cont.fn != nil:
-    submit(cont, int(fd))
+    # A non-worker's own-lane completion inside its `passiveWait` poll stays
+    # with that thread (see `deferOwnReady`); every other path submits.
+    if not deferOwnReady(cont):
+      submit(cont, int(fd))
   else:
     gCqLock.acquire()
     if gCqCount < CqSize:
