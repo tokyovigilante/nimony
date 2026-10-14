@@ -10,18 +10,37 @@
 ##      stripes kept non-empty (the callee is re-queued behind them). Dequeues
 ##      keep the clock restarting: the stall counter stays 0 and no chew task
 ##      runs on main.
+##   f   idle, then work arrives (the wait clock starts only on an observed
+##       non-empty queue): a callee spins 700 ms on a worker; at 600 ms a third
+##       thread enqueues a marker. N = 2: the other worker is idle and takes the
+##       marker at once. N = 1: the marker sits behind the callee for ~100 ms
+##       (< 250 ms). Counter 0, no marker on main. (An idle period of 600 ms
+##       must not count towards the 250 ms.)
+##   g   (positive, kept here as the other half of the clock rules) submit-then-
+##       wait loop, N = 1: the only worker is wedged on a task W that spins until
+##       the task X queued behind it has run; main repeatedly submits a no-op
+##       (it succeeds, the queues are not full) and then waits 10 ms on its own
+##       lane. Neither the successful enqueue nor the own-lane completion may
+##       stop the wait clock: X runs on main within 1 s via the fallback,
+##       counter >= 1. W gives up after 2 s, so a pool without the fallback
+##       fails instead of hanging.
+## Worst case per child: c/d/f 10 x 0.45 s (f: 10 x 0.75 s = 7.5 s), g 10 x 0.27 s;
+## per file (f and g add three children) <= 40 s, far below the 120 s timeout.
 ## NW_TIMES=1 prints each child's wall time to stderr, NW_INFO=1 extra counters.
 
 {.feature: "assumeSync".}  # test program: globals shared freely
 
 import deps/nwlatch
-import std / [atomics, threadpool, syncio, envvars]
+import std / [atomics, threadpool, rawthreads, syncio, envvars, ioring]
 
 type ChewFrame = object of CoroutineBase
 
 const
   Iters = 10
   SpanMs = 400
+  LongMs = 700       # (f) the callee's spin
+  ArriveMs = 600     # (f) when the marker arrives
+  GiveUpMs = 2000    # (g) W's own give-up
 
 var
   deadline: int
@@ -54,7 +73,79 @@ proc chewFn(coro: ptr CoroutineBase): Continuation {.nimcall.} =
   else:
     result = Continuation(fn: nil, env: nil)
 
+type GFrame = object of CoroutineBase
+
+var
+  gFrame: GFrame
+  gGate, gXRan, gWIn, gWDone: int
+  arriveThread: RawThread
+
+proc longCallee() {.passive.} =
+  let c = delay()
+  submit(c)
+  suspend()
+  let end0 = nowMs() + LongMs
+  while nowMs() < end0: cpuRelax()
+
+proc arriveMain(arg: pointer) {.nimcall.} =
+  sleepMs(ArriveMs)
+  submit(markerCont(), 0)
+
+proc gWFn(env: ptr CoroutineBase): Continuation {.nimcall.} =
+  atomicStore(gWIn, 1, moSequentiallyConsistent)
+  let t0 = nowMs()
+  while atomicLoad(gGate, moAcquire) == 0 and nowMs() - t0 < GiveUpMs: cpuRelax()
+  atomicStore(gWDone, 1, moSequentiallyConsistent)
+  result = Continuation(fn: nil, env: nil)
+
+proc gXFn(env: ptr CoroutineBase): Continuation {.nimcall.} =
+  atomicStore(gGate, 1, moRelease)
+  atomicStore(gXRan, if isPoolWorker(): 1 else: 2, moRelease)
+  result = Continuation(fn: nil, env: nil)
+
+proc parkOnTimer(ms: int) {.passive.} =
+  let c = delay()
+  discard submitTimeout(afterMs(ms), c)
+  suspend()
+
+proc childG() =
+  startWatchdog(55)
+  var aborted, late, notOnMain, noFallback = 0
+  var maxMs = 0
+  for it in 0 ..< Iters:
+    resetCounters()
+    atomicStore(gGate, 0, moSequentiallyConsistent)
+    atomicStore(gXRan, 0, moSequentiallyConsistent)
+    atomicStore(gWIn, 0, moSequentiallyConsistent)
+    atomicStore(gWDone, 0, moSequentiallyConsistent)
+    submit(Continuation(fn: gWFn, env: addr gFrame), 0)
+    if not waitFor(gWIn, 1, 2000):
+      inc aborted
+      continue
+    submit(Continuation(fn: gXFn, env: addr gFrame), 0)    # queued behind W
+    let before = stallRuns()
+    let t0 = nowMs()
+    while atomicLoad(gXRan, moAcquire) == 0 and nowMs() - t0 < GiveUpMs - 300:
+      submit(noopCont(), 0)       # succeeds: the queues are far from full
+      parkOnTimer(10)             # then an own-lane wait of 10 ms
+    let dt = nowMs() - t0
+    maxMs = max(maxMs, dt)
+    if dt >= 1000: inc late
+    if atomicLoad(gXRan, moAcquire) != 2: inc notOnMain
+    if stallRuns() - before < 1: inc noFallback
+    atomicStore(gGate, 1, moRelease)
+    discard waitFor(gWDone, 1, 5000)
+    discard quiesce()
+  echo "N=", poolN, " phase=g iterations=", Iters, " aborted=", aborted,
+    " late=", late, " x_not_on_main=", notOnMain, " nofallback=", noFallback
+  if getEnv("NW_INFO").len > 0:
+    echo "info N=", poolN, " phase=g max_ms=", maxMs, " stall_seam=", hasStallSeam,
+      " stall_runs=", stallRuns()
+
 proc child(phase: string) =
+  if phase == "g":
+    childG()
+    return
   startWatchdog(55)
   var aborted = 0
   var stalled = 0
@@ -68,6 +159,14 @@ proc child(phase: string) =
     let t0 = nowMs()
     if phase == "c":
       spinCallee()
+    elif phase == "f":
+      try:
+        create arriveThread, arriveMain, nil
+      except:
+        echo "cannot start thread"
+      longCallee()
+      arriveThread.join()
+      if not waitFor(markerRuns, 1, 5000): inc aborted
     else:
       deadline = t0 + SpanMs
       for k in 0 ..< 8:
@@ -76,7 +175,7 @@ proc child(phase: string) =
     let dt = nowMs() - t0
     maxMs = max(maxMs, dt)
     minMs = min(minMs, dt)
-    if dt < SpanMs - 20: inc aborted      # the wait did not last as intended
+    if dt < (if phase == "f": LongMs else: SpanMs) - 20: inc aborted      # the wait did not last as intended
     if stallRuns() != before: inc stalled
     if atomicLoad(markerOnMain, moSequentiallyConsistent) > 0 or
         atomicLoad(chewOnMain, moSequentiallyConsistent) > 0: inc onmain
@@ -91,6 +190,9 @@ when defined(windows):
   for ph in ["c", "d"]:
     for n in 1 .. 2:
       echo "N=", n, " phase=", ph, " iterations=10 aborted=0 stalled=0 iterations_with_task_on_main=0"
+  for n in [2, 1]:
+    echo "N=", n, " phase=f iterations=10 aborted=0 stalled=0 iterations_with_task_on_main=0"
+  echo "N=1 phase=g iterations=10 aborted=0 late=0 x_not_on_main=0 nofallback=0"
 else:
   if getEnv("NW_PHASE").len > 0:
     child(getEnv("NW_PHASE"))
@@ -99,5 +201,8 @@ else:
     for ph in ["c", "d"]:
       for n in 1 .. 2:
         envs.add "NW_POOL_N=" & $n & " NW_PHASE=" & ph & " timeout 60"
+    envs.add "NW_POOL_N=2 NW_PHASE=f timeout 60"
+    envs.add "NW_POOL_N=1 NW_PHASE=f timeout 60"
+    envs.add "NW_POOL_N=1 NW_PHASE=g timeout 60"
     if not runChildren(envs):
       echo "FAIL"
