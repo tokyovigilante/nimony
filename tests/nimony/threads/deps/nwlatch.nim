@@ -192,9 +192,13 @@ proc runChildren*(envs: openArray[string]): bool =
   ## environment prefix such as "NW_POOL_N=2") and print what the children
   ## print. A pool starts once per process, so each configuration needs its own.
   result = true
+  let times = getEnv("NW_TIMES").len > 0
   for e in envs:
     try:
+      let t0 = nowMs()
       let (outp, code) = execCmdEx(e & " " & getAppFilename())
+      if times:
+        stderr.write "time [" & e & "] " & $(nowMs() - t0) & " ms\n"
       stdout.write outp
       if code != 0:
         echo "child [", e, "] failed with status ", code
@@ -220,6 +224,26 @@ else:
   const hasSeams* = false
   proc seamInOwnWait*(): bool = false
   proc seamRedirects*(): int = 0
+
+when compiles(nonWorkerStallRuns):
+  const hasStallSeam* = true
+  proc stallRuns*(): int = atomicLoad(nonWorkerStallRuns, moSequentiallyConsistent)
+else:
+  const hasStallSeam* = false
+  proc stallRuns*(): int = 0
+
+proc fillPool*(): bool =
+  ## With the workers latched: fill the stripes and the inject queue to the last
+  ## slot with no-op tasks (the capacity is read from the pool, not assumed).
+  ## True when it is exactly full and no marker ran on a non-worker meanwhile.
+  let mainBefore = atomicLoad(markerOnMain, moSequentiallyConsistent)
+  let cap = poolQueueStats().capacity
+  var filled = poolQueueStats().queued
+  while filled < cap:
+    submit(noopCont(), filled)
+    inc filled
+  result = poolQueueStats().queued == cap and
+           atomicLoad(markerOnMain, moSequentiallyConsistent) == mainBefore
 
 # ------------------------------------------------------------------- pipe ---
 
