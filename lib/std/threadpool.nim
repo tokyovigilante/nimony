@@ -120,8 +120,8 @@ proc napMicros(us: int) =
 # --- Stall detection for non-worker threads ---
 #
 # A non-worker leaves the shared stripes to the workers (see `submit`,
-# `nonWorkerWait`) unless the pool looks wedged: no shared queue has removed a
-# single task for `NonWorkerStallMs`. Then it helps exactly as it did before the
+# `nonWorkerWait`) unless the pool looks wedged: a queue holds work and no
+# shared queue has removed a single task for `NonWorkerStallMs`. Then it helps exactly as it did before the
 # change, so a program that progressed then still progresses (an extra delay of
 # at most `NonWorkerStallMs` per stall episode, not per task).
 
@@ -137,27 +137,27 @@ var
 
 type
   StallClock = object
-    ## One per non-worker code path (`submit`, `passiveWait`), thread-local.
+    ## The submit clock, thread-local: armed by the first failed enqueue of a
+    ## saturated `submit`, disarmed by any successful enqueue of this thread.
     armed: bool
     stallStart: int   ## ms; when the current quiet period began
     lastSum: int      ## `progressSum()` at `stallStart` or the last change
-    lastSample: int   ## ms; the previous `passiveWait` sample
+  WaitClock = object
+    ## The `passiveWait` clock, thread-local (see `waitStalled`).
+    accruing: bool    ## a queue was non-empty at the last sample and nothing dequeued since
+    stallStart: int   ## ms; when accrual began or the sum last changed
+    lastSum: int      ## `progressSum()` at the last sample that updated it
+    lastSample: int   ## ms; the previous sample, at most one per ms
 
 var
   submitClock {.threadvar.}: StallClock
-  waitClock {.threadvar.}: StallClock
-  inStallDrain {.threadvar.}: bool
-    ## True while this non-worker runs a fallback batch in `nonWorkerWait`.
+  waitClock {.threadvar.}: WaitClock
 
 proc noteEnqueued() {.inline.} =
-  ## A non-worker's successful enqueue disarms its submit clock. It also ends the
-  ## wait clock's evidence: a thread that enqueues a task (typically the
-  ## continuation of a passive call it is about to wait for) starts a new wait,
-  ## and a clock left armed by an earlier wait would otherwise call the pool
-  ## stalled although the task was queued a moment ago. The re-submits of the
-  ## wait's own fallback batch do not count.
+  ## A non-worker's successful enqueue disarms its submit clock. The wait clock
+  ## is deliberately not touched: it accrues on wall time while a queue holds
+  ## work and nothing dequeues, whatever else this thread does meanwhile.
   if submitClock.armed: submitClock.armed = false
-  if waitClock.armed and not inStallDrain: waitClock.armed = false
 
 proc monoMs(): int =
   when defined(windows):
@@ -168,13 +168,36 @@ proc monoMs(): int =
     discard clock_gettime(CLOCK_MONOTONIC, ts)
     result = int(ts.tv_sec) * 1000 + int(ts.tv_nsec) div 1_000_000
 
+type
+  DequeueCount {.align: 64.} = object
+    ## One cache line per counter so that bumping it never shares a line with
+    ## a stripe's lock or with another worker's counter.
+    n: int
+
+var
+  dequeueCounts: seq[DequeueCount]
+    ## `workerCount + 1` monotonic totals of tasks removed from the shared
+    ## stripes and the inject queue: slot `i` for worker `i` (single writer,
+    ## relaxed load + store), the last slot for every non-worker (rare,
+    ## `atomicFetchAdd`). Kept out of `FifoStripe` so that the stripes, which
+    ## the I/O op queues use too, keep their layout.
+
+proc noteDequeued(n: int) {.inline.} =
+  if isWorker:
+    atomicStore(dequeueCounts[threadIdx].n,
+                atomicLoad(dequeueCounts[threadIdx].n, moRelaxed) + n, moRelaxed)
+  else:
+    discard atomicFetchAdd(dequeueCounts[workerCount].n, n, moRelaxed)
+
 proc progressSum(): int =
   ## Total tasks ever dequeued from the shared stripes and the inject queue.
   ## Relaxed loads, no lock: enqueues and lock contention neither hide nor fake
-  ## a change. Only dequeues count.
-  result = atomicLoad(injectQueue.dequeued, moRelaxed)
-  for i in 0 ..< workerCount:
-    result += atomicLoad(localQueues[i].dequeued, moRelaxed)
+  ## a change. Only dequeues count. The count is bumped just after the dequeue
+  ## releases the stripe lock, so a reader can lag a dequeue by a few
+  ## instructions; that is irrelevant against a 250 ms threshold.
+  result = 0
+  for i in 0 .. workerCount:
+    result += atomicLoad(dequeueCounts[i].n, moRelaxed)
 
 # --- Submit / dequeue ---
 
@@ -331,6 +354,7 @@ proc tryBulkDequeue(stripe: int; buf: var array[BulkSize, Task]): int =
     result = injectQueue.tryBulkDequeue(BulkSize, buf)
   if result == 0:
     result = localQueues[s].tryBulkDequeue(BulkSize, buf)
+  if result > 0: noteDequeued(result)
 
 proc drainOnce(startStripe: int): bool =
   ## Dequeue the first non-empty stripe (searching from `startStripe`, for
@@ -426,9 +450,9 @@ proc workCycle(stripe: int): bool =
 # stripes while the pool is live: those tasks belong to the workers (they may
 # take locks, or arm I/O on the lane of the thread that runs them), and a
 # foreign thread running one would put its continuation on a lane no worker
-# drains. The exception is a stalled pool: when no shared queue has dequeued
-# anything for `NonWorkerStallMs`, the waiter runs one batch per call as it did
-# before (`waitStalled`). See doc/passive_procs.md, "Non-worker waits".
+# drains. The exception is a stalled pool: when a queue holds work and nothing
+# has been dequeued for `NonWorkerStallMs`, the waiter runs one batch per sample
+# as it did before (`waitStalled`). See doc/passive_procs.md, "Non-worker waits".
 
 var
   inOwnWait {.threadvar.}: bool
@@ -486,48 +510,61 @@ proc ownLanePoll(timeoutMs: cint): bool =
       while c.fn != nil:
         c = c.fn(c.env)
 
+proc anyQueued(): bool =
+  ## Does some shared queue hold a task? Try-lock only: a busy lock says
+  ## nothing and counts as "no", so contention can never start accrual.
+  for i in 0 .. workerCount:
+    let q = if i < workerCount: addr localQueues[i] else: addr injectQueue
+    if tryAcquireSys(q[].lock):
+      let has = q[].count > 0
+      releaseSys(q[].lock)
+      if has: return true
+  result = false
+
 proc waitStalled(): bool =
-  ## Late-phase sample of the pool's dequeue counter (see `StallClock`): true
-  ## when it has not moved for `NonWorkerStallMs` of this wait.
+  ## Sample the pool at most once per ms, in any phase of the wait. True when a
+  ## queue has held work with no dequeue anywhere for `NonWorkerStallMs`.
+  ## Soundness: items leave a stripe only through `tryBulkDequeue`, which bumps
+  ## the sum, so "non-empty at one sample and the sum unchanged at a later one"
+  ## means nothing was dequeued in between and the queue stayed non-empty. The
+  ## clock runs on wall time: own-lane work, back-off resets and gaps between
+  ## waits do not stop it. An idle pool (all queues empty) never starts it.
   let now = monoMs()
-  let sum = progressSum()
-  if waitClock.armed and now - waitClock.lastSample > 5:
-    waitClock.armed = false       # a gap between hook calls: a new wait
-  if not waitClock.armed:
-    waitClock = StallClock(armed: true, stallStart: now, lastSum: sum, lastSample: now)
-    return false
-  if sum != waitClock.lastSum:
-    waitClock.lastSum = sum
-    waitClock.stallStart = now
+  if now - waitClock.lastSample < 1: return false
   waitClock.lastSample = now
-  result = now - waitClock.stallStart >= NonWorkerStallMs
+  let sum = progressSum()
+  if waitClock.accruing and sum == waitClock.lastSum:
+    return now - waitClock.stallStart >= NonWorkerStallMs
+  waitClock.lastSum = sum
+  waitClock.stallStart = now
+  waitClock.accruing = anyQueued()
+  result = false
 
 proc nonWorkerWait() =
   let n = idleCalls
   let late = n >= SpinCalls + YieldCalls
-  if ownLanePoll(if late: 1.cint else: 0.cint):
-    idleCalls = 0
-    waitClock.armed = false
+  let stalled = waitStalled()
+  let worked = ownLanePoll(if late: 1.cint else: 0.cint)
+  if worked: idleCalls = 0   # own work resets the back-off and nothing else
+  if stalled:
+    # Work queued and nothing dequeued anywhere for NonWorkerStallMs: the
+    # workers may be waiting on us. Help as before, one batch per sample while
+    # the pool stays wedged.
+    if drainOnce(0):
+      discard atomicFetchAdd(nonWorkerStallRuns, 1, moRelaxed)
+    # Our own dequeues are not progress; a worker dequeue in this window is
+    # absorbed (harmless). stallStart stays, so a still-wedged pool fires again
+    # at the next sample; an emptied one stops accruing.
+    waitClock.lastSum = progressSum()
+    waitClock.lastSample = monoMs()
+    waitClock.accruing = anyQueued()
     return
+  if worked: return
   inc idleCalls
   if n < SpinCalls:
     for _ in 0 ..< RelaxPerCall: cpuRelax()
   elif n < SpinCalls + YieldCalls:
     yieldThread()
-  elif waitStalled():
-    # Nothing dequeued anywhere for NonWorkerStallMs: the workers may be waiting
-    # on us. Help as before, one batch per call while the pool stays wedged.
-    inStallDrain = true
-    let ran = drainOnce(0)
-    inStallDrain = false
-    if ran:
-      discard atomicFetchAdd(nonWorkerStallRuns, 1, moRelaxed)
-    elif not gReactorWaits:
-      napMicros(1000)
-    # Our own dequeues are not progress; a worker dequeue in this window is
-    # absorbed (harmless). The back-off counter and stallStart stay.
-    waitClock.lastSum = progressSum()
-    waitClock.lastSample = monoMs()
   elif not gReactorWaits:
     napMicros(1000)
 
@@ -596,6 +633,7 @@ proc initPool*(count = 0) =
     for i in 0..<workerCount:
       localQueues[i].init(StripeSize)
     injectQueue.init(StripeSize*16)
+    dequeueCounts = newSeq[DequeueCount](workerCount + 1)
     workers.setLen(workerCount)
     let toStart = if poolTestWorkerLimit >= 0: min(poolTestWorkerLimit, workerCount)
                   else: workerCount

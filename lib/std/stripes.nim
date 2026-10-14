@@ -29,11 +29,6 @@ type
     ## initialised stripe must not be moved.
     lock*: SysLock
     head*, tail*, count*: int
-    dequeued*: int
-      ## Total number of items ever removed (monotonic, 64-bit on 64-bit
-      ## targets, unaffected by `grow`). Written under `lock` with a relaxed
-      ## atomic store, so another thread may read it with a relaxed atomic load
-      ## and no lock: a change means some thread dequeued from this stripe.
     data*: seq[T]
 
 proc init*[T: HasDefault](s: var FifoStripe[T]; capacity: int) =
@@ -70,8 +65,6 @@ proc tryBulkDequeue*[T: HasDefault](s: var FifoStripe[T]; bulkSize: int; buf: va
       buf[i] = s.data[s.head and (s.data.len - 1)]
       s.head = (s.head + 1) and (s.data.len - 1)
   dec s.count, result
-  if result > 0:
-    atomicStore(s.dequeued, s.dequeued + result, moRelaxed)
   releaseSys(s.lock)
 
 proc grow*[T: HasDefault](s: var FifoStripe[T]; newCapacity: int) =
