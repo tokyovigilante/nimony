@@ -11,11 +11,16 @@
 ##      keep the clock restarting: the stall counter stays 0 and no chew task
 ##      runs on main.
 ##   f   idle, then work arrives (the wait clock starts only on an observed
-##       non-empty queue): a callee spins 700 ms on a worker; at 600 ms a third
-##       thread enqueues a marker. N = 2: the other worker is idle and takes the
-##       marker at once. N = 1: the marker sits behind the callee for ~100 ms
-##       (< 250 ms). Counter 0, no marker on main. (An idle period of 600 ms
-##       must not count towards the 250 ms.)
+##       non-empty queue). Iteration i: a third thread enqueues a marker at
+##       430 + 10 (i / 2) ms (even i) or 680 + 10 (i / 2) ms (odd i), and the
+##       callee spins on a worker until 150 ms after that. The arrivals sit
+##       just before ~501 ms and ~752 ms, where a clock that restarted
+##       `accruing` by itself at each reset (instead of at the first observed
+##       non-empty queue; its empty fires restart it at ~250, ~501 and ~752 ms)
+##       would fire with the marker queued and run it on main. N = 2: the other
+##       worker is idle and takes the marker at once. N = 1: the marker sits
+##       behind the callee for ~150 ms (< 250 ms). Counter 0, no marker on main.
+##       (An idle period of up to 720 ms must not count towards the 250 ms.)
 ##   g   (positive, kept here as the other half of the clock rules) submit-then-
 ##       wait loop, N = 1: the only worker is wedged on a task W that spins until
 ##       the task X queued behind it has run; main repeatedly submits a no-op
@@ -24,7 +29,8 @@
 ##       stop the wait clock: X runs on main within 1 s via the fallback,
 ##       counter >= 1. W gives up after 2 s, so a pool without the fallback
 ##       fails instead of hanging.
-## Worst case per child: c/d/f 10 x 0.45 s (f: 10 x 0.75 s = 7.5 s), g 10 x 0.27 s;
+## Worst case per child: c/d 10 x 0.45 s, f 10 x (arrival 430..720 + 150) ms = about 7.4 s
+## (plus the 5 s marker wait only on failure), g 10 x 0.27 s;
 ## per file (f and g add three children) <= 40 s, far below the 120 s timeout.
 ## NW_TIMES=1 prints each child's wall time to stderr, NW_INFO=1 extra counters.
 
@@ -38,8 +44,7 @@ type ChewFrame = object of CoroutineBase
 const
   Iters = 10
   SpanMs = 400
-  LongMs = 700       # (f) the callee's spin
-  ArriveMs = 600     # (f) when the marker arrives
+  BehindMs = 150     # (f) how long the marker sits behind the callee (N = 1)
   GiveUpMs = 2000    # (g) W's own give-up
 
 var
@@ -79,16 +84,17 @@ var
   gFrame: GFrame
   gGate, gXRan, gWIn, gWDone: int
   arriveThread: RawThread
+  arriveMs, longMs: int    # (f) this iteration's marker arrival and callee end
 
 proc longCallee() {.passive.} =
   let c = delay()
   submit(c)
   suspend()
-  let end0 = nowMs() + LongMs
+  let end0 = nowMs() + longMs
   while nowMs() < end0: cpuRelax()
 
 proc arriveMain(arg: pointer) {.nimcall.} =
-  sleepMs(ArriveMs)
+  sleepMs(arriveMs)
   submit(markerCont(), 0)
 
 proc gWFn(env: ptr CoroutineBase): Continuation {.nimcall.} =
@@ -160,6 +166,8 @@ proc child(phase: string) =
     if phase == "c":
       spinCallee()
     elif phase == "f":
+      arriveMs = (if it mod 2 == 0: 430 else: 680) + 10 * (it div 2)
+      longMs = arriveMs + BehindMs
       try:
         create arriveThread, arriveMain, nil
       except:
@@ -175,7 +183,7 @@ proc child(phase: string) =
     let dt = nowMs() - t0
     maxMs = max(maxMs, dt)
     minMs = min(minMs, dt)
-    if dt < (if phase == "f": LongMs else: SpanMs) - 20: inc aborted      # the wait did not last as intended
+    if dt < (if phase == "f": longMs else: SpanMs) - 20: inc aborted      # the wait did not last as intended
     if stallRuns() != before: inc stalled
     if atomicLoad(markerOnMain, moSequentiallyConsistent) > 0 or
         atomicLoad(chewOnMain, moSequentiallyConsistent) > 0: inc onmain
