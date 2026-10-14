@@ -398,8 +398,8 @@ thread) is a guest of the pool. While the pool is **live** (at least one worker 
 is running and `shutdownPool` has not been called):
 
 * Its wait in `complete()` — the pool's `passiveWait` hook — polls **only its own I/O
-  lane**. It never dequeues from the shared stripes or the inject queue and never runs a
-  pool task. Tasks on the shared stripes are the workers' business: they may take locks
+  lane**. It does not dequeue from the shared stripes or the inject queue and does not run
+  a pool task (except under the stall fallback below). Tasks on the shared stripes are the workers' business: they may take locks
   or arm I/O on the lane of whichever thread runs them, and a foreign thread running
   one would leave that continuation on the shared trailing lane, which no worker drains.
 * A completion on its own lane during that poll is not sent to the pool. The backend
@@ -419,15 +419,36 @@ is running and `shutdownPool` has not been called):
   for a slot** (spin, yield, then 50 us naps) instead of running the continuation
   inline ("caller-runs"). Workers keep caller-runs: they re-submit from inside the
   trampoline and a blocking worker could deadlock the pool.
+* **Stall fallback.** Both rules above hold only while the pool is making progress. Each
+  shared stripe and the inject queue count the tasks ever dequeued from them
+  (`FifoStripe.dequeued`); a non-worker reads the sum without a lock. If the sum has not
+  changed for `NonWorkerStallMs` (250 ms, `-d:NonWorkerStallMs=N`), the pool is wedged
+  as far as the non-worker can tell, and it reverts to the earlier behaviour: a wait
+  runs one batch of shared tasks per call, a saturated `submit` runs its task inline.
+  Enqueues and lock contention do not count as progress, so other threads cannot keep
+  the fallback away. A saturated `submit` re-arms its clock on every successful enqueue
+  from that thread; a wait re-arms on any work on its own lane. `nonWorkerStallRuns`
+  counts the fallbacks (tests, diagnostics).
 
-Why this cannot deadlock: workers never wait on a non-worker, so every task a
-non-worker waits for sits on a shared stripe or a worker lane, which workers drain,
-and the stripes are emptied by workers alone, so a full queue frees as long as one
-worker is alive. This holds for any worker count, including a worker that is itself in
-`passiveWait` (a worker's wait still does a worker's turn). The non-worker's own ring
-operations are still polled by itself. A non-worker that submitted the only
-continuation able to finish what it waits on, while the pool is saturated with tasks
-that wait on that non-worker, is excluded by "workers never wait on a non-worker".
+Why this cannot deadlock: the premise is not "workers never wait on a non-worker". A
+worker may wait on one (for example every worker gated on a flag that the non-worker
+sets only after its `submit` returns), and then no slot ever frees and nothing is
+dequeued. That is exactly the case the stall fallback catches: after `NonWorkerStallMs`
+without a dequeue the non-worker behaves as it did before this rule existed, so every
+program that progressed then still progresses, with an extra delay of at most
+`NonWorkerStallMs` per stall episode (not per task). While the pool does dequeue, every
+task a non-worker waits for sits on a shared stripe or a worker lane that the workers
+drain, and the non-worker's own ring operations are polled by itself. This holds for any
+worker count, including a worker that is itself in `passiveWait` (a worker's wait still
+does a worker's turn).
+
+What is guaranteed: a non-worker never runs a foreign task unless no shared queue
+dequeued anything for at least `NonWorkerStallMs`. What is not: a pool whose workers all
+run long tasks (more than 250 ms, say a decode backlog) with work queued behind them
+looks stalled, and a waiting or saturated non-worker then helps as before. The rule
+narrows the exposure of code that must not run on a foreign thread; it does not remove
+it, so such code should still keep non-pool threads out of `complete()`, `passiveWait`
+and `||` joins.
 
 If the pool is **not live** (`shutdownPool` was called, or no worker thread could be
 started) there is nobody else to run the tasks, so a non-worker falls back to the
