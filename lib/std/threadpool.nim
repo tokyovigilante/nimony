@@ -117,6 +117,65 @@ proc napMicros(us: int) =
     var rem = Timespec()
     discard nanosleep(ts, rem)
 
+# --- Stall detection for non-worker threads ---
+#
+# A non-worker leaves the shared stripes to the workers (see `submit`,
+# `nonWorkerWait`) unless the pool looks wedged: no shared queue has removed a
+# single task for `NonWorkerStallMs`. Then it helps exactly as it did before the
+# change, so a program that progressed then still progresses (an extra delay of
+# at most `NonWorkerStallMs` per stall episode, not per task).
+
+const
+  NonWorkerStallMs* {.intdefine.} = 250
+    ## How long no queue may dequeue before a non-worker runs pool tasks itself.
+
+var
+  nonWorkerStallRuns*: int
+    ## Atomic. How often a non-worker fell back to running pool work because
+    ## the pool was stalled: saturated submits that ran their task inline plus
+    ## waits that ran at least one task. Meant for tests and diagnostics.
+
+type
+  StallClock = object
+    ## One per non-worker code path (`submit`, `passiveWait`), thread-local.
+    armed: bool
+    stallStart: int   ## ms; when the current quiet period began
+    lastSum: int      ## `progressSum()` at `stallStart` or the last change
+    lastSample: int   ## ms; the previous `passiveWait` sample
+
+var
+  submitClock {.threadvar.}: StallClock
+  waitClock {.threadvar.}: StallClock
+  inStallDrain {.threadvar.}: bool
+    ## True while this non-worker runs a fallback batch in `nonWorkerWait`.
+
+proc noteEnqueued() {.inline.} =
+  ## A non-worker's successful enqueue disarms its submit clock. It also ends the
+  ## wait clock's evidence: a thread that enqueues a task (typically the
+  ## continuation of a passive call it is about to wait for) starts a new wait,
+  ## and a clock left armed by an earlier wait would otherwise call the pool
+  ## stalled although the task was queued a moment ago. The re-submits of the
+  ## wait's own fallback batch do not count.
+  if submitClock.armed: submitClock.armed = false
+  if waitClock.armed and not inStallDrain: waitClock.armed = false
+
+proc monoMs(): int =
+  when defined(windows):
+    proc GetTickCount64(): uint64 {.importc: "GetTickCount64", stdcall, dynlib: "kernel32".}
+    result = int(GetTickCount64())
+  else:
+    var ts = default(Timespec)
+    discard clock_gettime(CLOCK_MONOTONIC, ts)
+    result = int(ts.tv_sec) * 1000 + int(ts.tv_nsec) div 1_000_000
+
+proc progressSum(): int =
+  ## Total tasks ever dequeued from the shared stripes and the inject queue.
+  ## Relaxed loads, no lock: enqueues and lock contention neither hide nor fake
+  ## a change. Only dequeues count.
+  result = atomicLoad(injectQueue.dequeued, moRelaxed)
+  for i in 0 ..< workerCount:
+    result += atomicLoad(localQueues[i].dequeued, moRelaxed)
+
 # --- Submit / dequeue ---
 
 proc tryEnqueue(s: int; t: Task): bool {.inline.} =
@@ -141,28 +200,49 @@ proc submit*(t: Task; h = 0) =
   ##   trampolining it on the calling thread and handing the remainder back to
   ##   the pool the moment a slot frees — rather than dropping it or blocking.
   ## * on a **non-worker** while the pool is live (`poolLive`), wait for a slot
-  ##   (spin, yield, then 50 us naps) and enqueue. A foreign thread never runs
+  ##   (spin, yield, then 50 us naps) and enqueue. A foreign thread does not run
   ##   shared pool tasks inline: they may take locks or arm I/O that only the
-  ##   pool is meant to touch.
+  ##   pool is meant to touch. It does so only if the pool looks wedged: no
+  ##   queue has dequeued anything for `NonWorkerStallMs` (see `StallClock`).
+  ##   Then it runs the task inline as before.
   ##
   ## Why workers cannot block: they re-submit continuations from inside the
   ## trampoline (see `workerLoop`). A blocking `submit` could park every worker
   ## on a full queue with none left to drain it -> deadlock. Caller-runs
   ## instead guarantees forward progress, so the queue stays bounded at
-  ## `StripeCount*StripeSize`. A non-worker's wait is safe because workers never
-  ## wait on a non-worker: the queues are emptied by workers alone, so a slot
-  ## frees as long as one worker is alive (`poolLive`); once none is, a
-  ## non-worker falls back to caller-runs so nothing hangs.
+  ## `StripeCount*StripeSize`.
+  ##
+  ## Why a non-worker's wait ends: a worker can itself wait on the non-worker
+  ## (for example every worker gated on a flag the non-worker sets after its
+  ## submit returns), so a slot need not ever free. The stall check bounds the
+  ## wait: if nothing dequeues for `NonWorkerStallMs` the non-worker falls back
+  ## to caller-runs, which is what every program relied on before. Without live
+  ## workers (`poolLive` false) it does so at once.
   workerMetrics[threadIdx].tasksSubmited += 1
-  if tryEnqueueAny(t, h): return
+  if tryEnqueueAny(t, h):
+    if not isWorker: noteEnqueued()
+    return
   if not isWorker and poolLive():
     var spins = 0
     while true:
+      # The attempt just failed: sample the dequeue counter first.
+      let sum = progressSum()
+      let now = monoMs()
+      if not submitClock.armed:
+        submitClock = StallClock(armed: true, stallStart: now, lastSum: sum)
+      elif sum != submitClock.lastSum:
+        submitClock.lastSum = sum
+        submitClock.stallStart = now
+      elif now - submitClock.stallStart >= NonWorkerStallMs:
+        discard atomicFetchAdd(nonWorkerStallRuns, 1, moRelaxed)
+        break
       if spins < 64: cpuRelax()
       elif spins < 128: yieldThread()
       else: napMicros(50)
       inc spins
-      if tryEnqueueAny(t, h): return
+      if tryEnqueueAny(t, h):
+        noteEnqueued()
+        return
       if not poolLive(): break
   # Saturated: run it here. `c.fn` returns the next continuation, or one whose
   # `fn` is nil when the task completes or parks (I/O will resume a parked one).
@@ -342,11 +422,13 @@ proc workCycle(stripe: int): bool =
 # --- Non-worker waits ---
 #
 # A thread that is not a pool worker and waits for a parked `.passive` call
-# (`complete`) polls only its OWN I/O lane and never pops tasks off the shared
+# (`complete`) polls only its OWN I/O lane and does not pop tasks off the shared
 # stripes while the pool is live: those tasks belong to the workers (they may
 # take locks, or arm I/O on the lane of the thread that runs them), and a
 # foreign thread running one would put its continuation on a lane no worker
-# drains. See doc/passive_procs.md, "Non-worker waits".
+# drains. The exception is a stalled pool: when no shared queue has dequeued
+# anything for `NonWorkerStallMs`, the waiter runs one batch per call as it did
+# before (`waitStalled`). See doc/passive_procs.md, "Non-worker waits".
 
 var
   inOwnWait {.threadvar.}: bool
@@ -404,17 +486,48 @@ proc ownLanePoll(timeoutMs: cint): bool =
       while c.fn != nil:
         c = c.fn(c.env)
 
+proc waitStalled(): bool =
+  ## Late-phase sample of the pool's dequeue counter (see `StallClock`): true
+  ## when it has not moved for `NonWorkerStallMs` of this wait.
+  let now = monoMs()
+  let sum = progressSum()
+  if waitClock.armed and now - waitClock.lastSample > 5:
+    waitClock.armed = false       # a gap between hook calls: a new wait
+  if not waitClock.armed:
+    waitClock = StallClock(armed: true, stallStart: now, lastSum: sum, lastSample: now)
+    return false
+  if sum != waitClock.lastSum:
+    waitClock.lastSum = sum
+    waitClock.stallStart = now
+  waitClock.lastSample = now
+  result = now - waitClock.stallStart >= NonWorkerStallMs
+
 proc nonWorkerWait() =
   let n = idleCalls
   let late = n >= SpinCalls + YieldCalls
   if ownLanePoll(if late: 1.cint else: 0.cint):
     idleCalls = 0
+    waitClock.armed = false
     return
   inc idleCalls
   if n < SpinCalls:
     for _ in 0 ..< RelaxPerCall: cpuRelax()
   elif n < SpinCalls + YieldCalls:
     yieldThread()
+  elif waitStalled():
+    # Nothing dequeued anywhere for NonWorkerStallMs: the workers may be waiting
+    # on us. Help as before, one batch per call while the pool stays wedged.
+    inStallDrain = true
+    let ran = drainOnce(0)
+    inStallDrain = false
+    if ran:
+      discard atomicFetchAdd(nonWorkerStallRuns, 1, moRelaxed)
+    elif not gReactorWaits:
+      napMicros(1000)
+    # Our own dequeues are not progress; a worker dequeue in this window is
+    # absorbed (harmless). The back-off counter and stallStart stay.
+    waitClock.lastSum = progressSum()
+    waitClock.lastSample = monoMs()
   elif not gReactorWaits:
     napMicros(1000)
 
@@ -424,9 +537,12 @@ proc passiveWait() {.nimcall.} =
   ## that waited idly could be the one the pool needed to resume the callee.
   ##
   ## A non-worker polls its own lane only (its I/O ops complete nowhere else,
-  ## see `ioLane`) and leaves the shared stripes to the workers, which never wait
-  ## on a non-worker. If no worker is alive (`poolLive`) it does a worker's turn
-  ## as before, so nothing that progressed then hangs now.
+  ## see `ioLane`) and leaves the shared stripes to the workers as long as the
+  ## pool keeps dequeuing. Workers may themselves wait on a non-worker, so if no
+  ## queue has dequeued anything for `NonWorkerStallMs` it runs one batch per
+  ## call as before (`nonWorkerStallRuns`), and if no worker is alive
+  ## (`poolLive`) it does a worker's turn at once: nothing that progressed
+  ## before hangs now.
   if isWorker:
     discard workCycle(threadIdx)
   elif poolLive():
