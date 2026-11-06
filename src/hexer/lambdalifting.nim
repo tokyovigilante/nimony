@@ -67,6 +67,7 @@ type
     typ: SymId
     mode: EnvMode
     needsHeap: bool
+    owner: SymId ## the creator whose environment instance `s` is
 
   EnvField = object
     objType: SymId
@@ -77,6 +78,9 @@ type
       ## non-owning `.cursor` field too, or hoisting it into the heap env
       ## re-forms the very ref cycle the cursor was written to break
       ## (env strongly owns the object that owns the closure -> leak).
+    owner: SymId
+      ## the routine whose environment INSTANCE holds the field: the routine
+      ## that declares the captured local (see `procParent`)
 
   ProcContext = object
     ## Per-LIFTING-ROOT state: created when either pass enters a top-level
@@ -85,8 +89,8 @@ type
     ## unrelated routine (sem restarts numbering per proc; iterinliner's
     ## `ii temps reset per proc) can never observe another root's captures.
     ## The key keeps the env OBJECT type sym alongside the local sym; within
-    ## one root every capture targets `procStack[0]`'s single shared env, so
-    ## the type half is constant here — kept for shape-compatibility with
+    ## one root every environment has the root's env type (see `procParent`),
+    ## so the type half is constant here — kept for shape-compatibility with
     ## `envTypeForProc` lookups.
     localToEnv: Table[(SymId, SymId), EnvField]
     env: CurrentEnv
@@ -98,6 +102,7 @@ type
     procStack: seq[SymId]
     dest: TokenBuf
     closureProcs, createsEnv, escapes: HashSet[SymId]
+    iterRoutines: HashSet[SymId] ## the `.closure` iters seen by pass 1
     nestedProcs: HashSet[SymId]
       ## the routines nested inside the CURRENT lifting root (root itself
       ## excluded). Cleared when the root is done — `closureProcs` is
@@ -108,6 +113,24 @@ type
       ## another routine of it — in call position or as a value. Feeds
       ## `propagateEnvNeed`.
     currentProc: ProcContext
+    procParent: Table[SymId, SymId]
+      ## nested routine -> the routine (or lifting root) it is declared in.
+      ##
+      ## Every routine that declares a captured local CREATES an environment
+      ## (`createsEnv`), one instance per call, so that a nested factory
+      ## `proc make(e: int): Hook = (proc(): int = e)` hands every closure it
+      ## returns an `e` of its own. All environments of one lifting root
+      ## share the root's env object type; a creator that itself needs an
+      ## enclosing environment (it is in `closureProcs`) links to it through
+      ## the env's `up` field (`upField`), and an access to a field owned
+      ## further out walks that chain (`emitEnvOf`). A closure receives, as
+      ## its `ep`, the environment of the nearest creator enclosing it.
+    fieldOwner: Table[SymId, SymId] ## env FIELD sym -> `EnvField.owner`
+    upField: Table[SymId, SymId]
+      ## env object type -> its `up` field (only roots with a chained env)
+    upIsRef: HashSet[SymId]
+      ## env object types whose environments live on the heap: `up` is a
+      ## `(ref RootObj)` rather than a `pointer`
     liftDepth: int
       ## the `procStack` depth of the routines that are not lifted: 1 inside
       ## a module level statement that is a lifting root, 0 otherwise
@@ -189,7 +212,20 @@ proc trLocal(c: var Context; dest: var TokenBuf; n: var Cursor) =
     c.typeCache.registerLocal(name, kind, typ, n)
     tr(c, dest, n)  # value
 
-proc propagateEnvNeed(c: var Context) =
+proc envTypeForProc(c: var Context; procId: SymId): SymId =
+  let s = pool.symVersionedBasename(procId)
+  result = pool.symId(derivedName(s, "env") & "." & c.thisModuleSuffix)
+
+proc isIterRoutine(s: SymId; c: Context): bool {.inline.} = s in c.iterRoutines
+
+proc creatorAbove(c: Context; s: SymId): SymId =
+  ## The nearest routine enclosing `s` (strictly) that creates an environment:
+  ## the one whose environment `s` receives as its `ep`.
+  result = c.procParent.getOrDefault(s)
+  while result != SymId(0) and result notin c.createsEnv:
+    result = c.procParent.getOrDefault(result)
+
+proc propagateEnvNeed(c: var Context; root: SymId) =
   ## A nested routine that MENTIONS a sibling needing the environment needs
   ## the environment too — it has to forward one it does not own:
   ##
@@ -215,15 +251,39 @@ proc propagateEnvNeed(c: var Context) =
   ## fixpoint over the edges collected for the whole root. Nim instead recurses
   ## into an unprocessed callee's body on first sight; we cannot, the body is
   ## simply the next tree in the buffer.
+  ##
+  ## What `user` has to forward is the environment `used` receives, that of
+  ## the nearest creator enclosing `used` — so `user` and every routine between
+  ## it and that creator need the environment, unless `user` IS that creator.
   var changed = true
   while changed:
     changed = false
     for i in 0 ..< c.nestedRefs.len:
       let (user, used) = c.nestedRefs[i]
       if user in c.nestedProcs and used in c.nestedProcs and
-          used in c.closureProcs and user notin c.closureProcs:
-        c.closureProcs.incl user
-        changed = true
+          used in c.closureProcs:
+        let t = c.creatorAbove(used)
+        var x = user
+        while x != t and x in c.nestedProcs:
+          if x notin c.closureProcs:
+            c.closureProcs.incl x
+            changed = true
+          x = c.procParent.getOrDefault(x)
+  # a creator that needs an enclosing environment links to it via `up`
+  var chained = false
+  for p in c.nestedProcs:
+    if p in c.createsEnv and p in c.closureProcs:
+      chained = true
+  if chained:
+    let envType = c.envTypeForProc(root)
+    var name = "up`f."
+    name.add $c.counter
+    inc c.counter
+    name.add "."
+    name.add c.thisModuleSuffix
+    c.upField[envType] = pool.symId(name)
+    if root in c.escapes:
+      c.upIsRef.incl envType
   c.nestedRefs.shrink 0
   c.nestedProcs = initHashSet[SymId]()
 
@@ -237,6 +297,7 @@ proc trProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
     c.procStack.add(symId)
     if c.procStack.len > 1:
       c.nestedProcs.incl symId
+      c.procParent[symId] = c.procStack[c.procStack.len-2]
     var isConcrete = true # assume it is concrete
     for i in 0..<BodyPos:
       if i == ParamsPos:
@@ -259,7 +320,7 @@ proc trProc(c: var Context; dest: var TokenBuf; n: var Cursor) =
       takeTree dest, n
     discard c.procStack.pop()
     if c.procStack.len == 0:
-      propagateEnvNeed c
+      propagateEnvNeed c, symId
       c.procEnvs[symId] = move c.currentProc   # hand the root's state to pass 2
   c.typeCache.closeScope()
 
@@ -284,11 +345,13 @@ proc trIterDecl(c: var Context; dest: var TokenBuf; n: var Cursor) =
     else:
       c.escapes.incl c.procStack[0]
     c.procStack.add(symId)
+    c.iterRoutines.incl symId
     if c.procStack.len > 1:
       # participate in `propagateEnvNeed`: a routine that mentions a
       # CAPTURING iter has to carry the environment to the point where the
       # iter's value (and with it the env slot in its frame) is built.
       c.nestedProcs.incl symId
+      c.procParent[symId] = c.procStack[c.procStack.len-2]
     var isConcrete = true # assume it is concrete
     for i in 0..<BodyPos:
       if i == ParamsPos:
@@ -307,15 +370,11 @@ proc trIterDecl(c: var Context; dest: var TokenBuf; n: var Cursor) =
       takeTree dest, n
     discard c.procStack.pop()
     if c.procStack.len == 0:
-      propagateEnvNeed c
+      propagateEnvNeed c, symId
       c.procEnvs[symId] = move c.currentProc
   c.typeCache.closeScope()
 
-proc envTypeForProc(c: var Context; procId: SymId): SymId =
-  let s = pool.symVersionedBasename(procId)
-  result = pool.symId(derivedName(s, "env") & "." & c.thisModuleSuffix)
-
-proc localToField(c: var Context; n: Cursor; local, typ: SymId; isCursor = false): SymId =
+proc localToField(c: var Context; n: Cursor; local, typ, owner: SymId; isCursor = false): SymId =
   if c.currentProc.localToEnv.hasKey((typ, local)):
     result = c.currentProc.localToEnv.getOrQuit((typ, local)).field
   else:
@@ -327,8 +386,10 @@ proc localToField(c: var Context; n: Cursor; local, typ: SymId; isCursor = false
     name.add c.thisModuleSuffix
     result = pool.symId(name)
     let localTyp = c.typeCache.getType(n)
-    c.currentProc.localToEnv[(typ, local)] = EnvField(objType: typ, field: result, typ: localTyp, isCursor: isCursor)
+    c.currentProc.localToEnv[(typ, local)] = EnvField(objType: typ, field: result, typ: localTyp,
+                                                      isCursor: isCursor, owner: owner)
     c.envFieldType[result] = localTyp
+    c.fieldOwner[result] = owner
 
 proc noteNestedRef(c: var Context; used: SymId) =
   ## Remember that the innermost nested routine mentions `used`. Whether
@@ -408,7 +469,7 @@ proc trToplevelStmt(c: var Context; dest: var TokenBuf; n: var Cursor) =
   c.procStack.add root
   tr(c, dest, n)
   discard c.procStack.pop()
-  propagateEnvNeed c
+  propagateEnvNeed c, root
   c.procEnvs[root] = move c.currentProc
 
 proc tr(c: var Context; dest: var TokenBuf; n: var Cursor) =
@@ -428,15 +489,20 @@ proc tr(c: var Context; dest: var TokenBuf; n: var Cursor) =
     if loc.kind in {ParamY, StaticParamY, LetY, VarY, ResultY, CursorY}:
       let cross = loc.crossedProc.int
       if cross > 0:
-        for i in c.procStack.len - cross ..< c.procStack.len:
+        # the routine declaring the local owns the field; it creates an
+        # environment per call (see `procParent`). An iterator's locals live
+        # in its coroutine frame, so they go to the environment the iterator
+        # receives: that of the nearest enclosing routine that is no iterator.
+        var o = max(0, c.procStack.len - 1 - cross)
+        while o > 0 and c.procStack[o].isIterRoutine(c):
+          dec o
+        for i in o+1 ..< c.procStack.len:
           c.closureProcs.incl(c.procStack[i])
-        let destEnv = c.procStack[0] #c.procStack.len - cross]
-        c.createsEnv.incl destEnv
-        let envType = c.envTypeForProc(destEnv)
-        let fld = c.localToField(n, n.symId, envType, isCursor = loc.kind == CursorY)
+        let owner = c.procStack[o]
+        c.createsEnv.incl owner
+        let envType = c.envTypeForProc(c.procStack[0])
+        let fld = c.localToField(n, n.symId, envType, owner, isCursor = loc.kind == CursorY)
         #[
-
-        Problem:
 
           proc outerA =
             var a: int
@@ -446,10 +512,9 @@ proc tr(c: var Context; dest: var TokenBuf; n: var Cursor) =
                 use a # uses env from outerA
                 use b # uses env from outerB
 
-        But there is only one environment parameter that `inner` can use
-        for the accesses to `a` and `b`. Luckily, we analyse the entire
-        `outerA` in one go, so we can use `outerA`'s environment for `outerB`
-        too.
+        `inner` has only one environment parameter, for the accesses to `a`
+        and `b`: it gets `outerB`'s environment, and `a` is reached through
+        its `up` link to `outerA`'s.
         ]#
         dest.copyIntoKind EnvpX, n.info:
           dest.addSymUse envType, n.info
@@ -640,6 +705,42 @@ proc typedEnv(dest: var TokenBuf; info: NifLineInfo; env: CurrentEnv)
         dest.addSymUse env.typ, info
       dest.addSymUse env.s, info
 
+proc addEnvPtrType(dest: var TokenBuf; info: NifLineInfo; env: CurrentEnv) =
+  dest.copyIntoKind (if env.needsHeap: RefT else: PtrT), info:
+    dest.addSymUse env.typ, info
+
+proc emitEnvOf(c: var Context; dest: var TokenBuf; info: NifLineInfo; target: SymId;
+               mode = WantValue) {.ensuresNif: addedExpr(dest).} =
+  ## The erased environment INSTANCE of the creator `target`: the current
+  ## environment, or one reached from it through the `up` chain (see
+  ## `procParent`). `target == 0` means "whatever is current".
+  let env = c.currentProc.env
+  var hops = 0
+  if target != SymId(0) and env.owner != SymId(0):
+    var x = env.owner
+    while x != target:
+      x = c.creatorAbove(x)
+      if x == SymId(0):
+        bug "lambdalifting: the environment of " & pool.symString(target) &
+            " is not reachable from that of " & pool.symString(env.owner) &
+            " at " & infoToStr(info)
+      inc hops
+  if hops == 0:
+    untypedEnv dest, info, env, mode
+  else:
+    let up = c.upField.getOrQuit(env.typ)
+    for _ in 0 ..< hops:
+      dest.addParLe DotX, info
+      dest.addParLe DerefX, info
+      dest.addParLe CastX, info
+      dest.addEnvPtrType info, env
+    untypedEnv dest, info, env, (if env.needsHeap: WantValue else: WantAddr)
+    for _ in 0 ..< hops:
+      dest.addParRi() # cast
+      dest.addParRi() # deref
+      dest.addSymUse up, info
+      dest.addParRi() # dot
+
 proc tre(c: var Context; dest: var TokenBuf; n: var Cursor)
   {.ensuresNif: addedAny(dest).}
 
@@ -689,7 +790,7 @@ proc emitIterValue(c: var Context; dest: var TokenBuf; iterSym: SymId; info: Nif
         setup.copyIntoKind DerefX, info:
           setup.addSymUse frameSym, info
         setup.addSymUse coro_transform.coroEnvFieldForIter(iterSym), info
-      setup.untypedEnv info, c.currentProc.env
+      c.emitEnvOf setup, info, c.creatorAbove(iterSym)
     c.hoisted.add setup
   dest.copyIntoKind TupconstrX, info:
     emitIterTupleTypeFromSym(dest, iterSym, info)
@@ -775,7 +876,8 @@ proc preLowerIter(c: var Context; n: var Cursor; iterSym: SymId;
     c.currentProc.env = CurrentEnv(s: pool.symId(ClosureEnvParamName),
                                    typ: c.envTypeForProc(c.procStack[0]),
                                    mode: EnvIsParam,
-                                   needsHeap: true)
+                                   needsHeap: true,
+                                   owner: c.creatorAbove(iterSym))
     init.copyIntoKind VarS, info:
       init.addSymDef c.currentProc.env.s, info
       init.addDotToken() # no export marker
@@ -1331,10 +1433,12 @@ proc treParams(c: var Context; dest, init: var TokenBuf; n: var Cursor; doAddEnv
 
 proc genEnvLocal(c: var Context; dest: var TokenBuf; owner: SymId; needsHeap: bool;
                  name = pool.symId(EnvLocalName)) =
-  ## Declares the environment local of the lifting root `owner` and makes it
-  ## the current environment.
-  let envTyp = c.envTypeForProc(owner)
-  c.currentProc.env = CurrentEnv(s: name, mode: EnvIsLocal, typ: envTyp, needsHeap: needsHeap)
+  ## Declares the environment local of the creator `owner` and makes it the
+  ## current environment. Every environment of a lifting root has the root's
+  ## env type.
+  let envTyp = c.envTypeForProc(c.procStack[0])
+  c.currentProc.env = CurrentEnv(s: name, mode: EnvIsLocal, typ: envTyp, needsHeap: needsHeap,
+                                 owner: owner)
   dest.copyIntoKind VarS, NoLineInfo:
     dest.addSymDef c.currentProc.env.s, NoLineInfo
     dest.addDotToken() # no export marker
@@ -1367,12 +1471,25 @@ proc treProcBody(c: var Context; dest, init: var TokenBuf; n: var Cursor; sym: S
       let oldEnv = c.currentProc.env
       if c.createsEnv.contains(sym):
         genEnvLocal c, dest, sym, needsHeap
+        if c.closureProcs.contains(sym):
+          # link to the enclosing environment this routine received
+          let info = n.info
+          dest.copyIntoKind AsgnS, info:
+            dest.copyIntoKind DotX, info:
+              if needsHeap:
+                dest.copyIntoKind DerefX, info:
+                  dest.addSymUse c.currentProc.env.s, info
+              else:
+                dest.addSymUse c.currentProc.env.s, info
+              dest.addSymUse c.upField.getOrQuit(c.currentProc.env.typ), info
+            dest.addSymUse pool.symId(ClosureEnvParamName), info
       elif c.closureProcs.contains(sym):
-        # The `ep.0 param carries the OUTERMOST proc's environment —
-        # captures always target `procStack[0]`'s env (one shared env,
-        # see the outerA/outerB note in pass 1) — so type it as that,
-        # not as this closure's own (never materialized) env type.
-        c.currentProc.env = CurrentEnv(s: pool.symId(ClosureEnvParamName), mode: EnvIsParam, typ: c.envTypeForProc(c.procStack[0]), needsHeap: needsHeap)
+        # The `ep.0 param carries the environment of the nearest enclosing
+        # creator; every environment of the root has the root's env type
+        # (see `procParent`).
+        c.currentProc.env = CurrentEnv(s: pool.symId(ClosureEnvParamName), mode: EnvIsParam,
+                                       typ: c.envTypeForProc(c.procStack[0]), needsHeap: needsHeap,
+                                       owner: c.creatorAbove(sym))
       else:
         c.currentProc.env = CurrentEnv(s: SymId(0), mode: EnvIsParam, typ: SymId(0), needsHeap: needsHeap)
       dest.add init
@@ -1716,6 +1833,7 @@ proc genCall(c: var Context; dest: var TokenBuf; n: var Cursor) =
   # `var typ` re-resolution above (envp / captured-dot callees) feeds the
   # non-static `else` branch of `wantsEnv`, so both survive.
   let isStatic = n.kind == Symbol and isStaticCall(c, n.symId)
+  let calleeSym = if isStatic: n.symId else: SymId(0)
   # A closure iter-value call target type can appear here in two guises:
   #   - raw `(itertype … (pragmas (closure)))` — `isClosure` matches.
   #   - lifted `(closureTuple <proctype> (ref RootObj))` — `isLiftedClosureTuple`
@@ -1745,7 +1863,7 @@ proc genCall(c: var Context; dest: var TokenBuf; n: var Cursor) =
       if c.currentProc.env.s != SymId(0):
         let mode = if c.currentProc.env.needsHeap: WantValue else: WantAddr
         # use the current environment as the last parameter:
-        untypedEnv dest, info, c.currentProc.env, mode
+        c.emitEnvOf dest, info, c.creatorAbove(calleeSym), mode
       else:
         # can happen for toplevel closures that have been declared .closure for interop
         # We have no environment here, so pass `nil` instead:
@@ -1862,7 +1980,7 @@ proc tre(c: var Context; dest: var TokenBuf; n: var Cursor) =
             # `untypedEnv`.)
             dest.copyIntoKind NilX, info: discard
           else:
-            dest.untypedEnv info, c.currentProc.env
+            c.emitEnvOf dest, info, c.creatorAbove(n.symId)
         inc n, SkipExpr
       else:
         # proc with closure pragma but doesn't capture any variables.
@@ -1980,13 +2098,17 @@ proc tre(c: var Context; dest: var TokenBuf; n: var Cursor) =
       of EnvpX:
         let info = n.info
         n.into:
+          var typ = n
+          skip n
+          assert n.kind == Symbol
+          let fld = n.symId
           dest.copyIntoKind DotX, info:
             dest.copyIntoKind DerefX, info:
               dest.copyIntoKind CastX, info:
                 dest.copyIntoKind (if c.currentProc.env.needsHeap: RefT else: PtrT), info:
-                  dest.takeTree n # type
-                dest.addSymUse c.currentProc.env.s, info
-            assert n.kind == Symbol
+                  dest.takeTree typ # type
+                c.emitEnvOf dest, info, c.fieldOwner.getOrDefault(fld),
+                  (if c.currentProc.env.needsHeap: WantValue else: WantAddr)
             dest.takeTree n # the symbol
       of TypeofX:
         takeTree dest, n
@@ -2061,6 +2183,20 @@ proc genObjectTypes(c: var Context; dest: var TokenBuf) =
             treType(c, dest, n) # type might need an environment parameter
             dest.addDotToken() # no default value
           programs.publish(field.field, dest, beforeField)
+        let up = c.upField.getOrDefault(objType)
+        if up != SymId(0):
+          # the link to the enclosing environment, erased like `ep`
+          let beforeField = dest.len
+          dest.copyIntoKind FldY, NoLineInfo:
+            dest.addSymDef up, NoLineInfo
+            dest.addDotToken() # no export marker
+            dest.addDotToken() # no pragmas
+            if c.upIsRef.contains(objType):
+              dest.addRootRef NoLineInfo
+            else:
+              dest.copyIntoKind PointerT, NoLineInfo: discard
+            dest.addDotToken() # no default value
+          programs.publish(up, dest, beforeField)
     programs.publish(objType, dest, beforeType)
 
 proc elimLambdas*(pass: var Pass) =
